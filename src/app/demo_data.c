@@ -58,6 +58,9 @@ void demo_data_init(dash_data_t *d, uint32_t now_ms)
     d->fuel_pct = 72u;
     d->battery_mv = 13800u;
     d->gear = 0u;
+    d->valid = DASH_VALID_ALL;
+    d->warnings = 0u;
+    d->link = DASH_LINK_DEMO;
 
     s_phase = PHASE_IDLE;
     s_rpm_x1000 = IDLE_RPM * 1000u;

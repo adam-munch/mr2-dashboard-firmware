@@ -11,14 +11,17 @@ set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_executable(host_tests
     test_main.c
     mock_eve.c
+    mock_can.c
     ${SRC}/eve/eve.c
     ${SRC}/eve/eve_panels.c
     ${SRC}/app/dashboard.c
     ${SRC}/app/demo_data.c
+    ${SRC}/app/ecu_link.c
     ${SRC}/app/fixmath.c
+    ${SRC}/app/rusefi_can.c
 )
 
-target_include_directories(host_tests PRIVATE . ${SRC}/eve ${SRC}/app)
+target_include_directories(host_tests PRIVATE . ${SRC}/eve ${SRC}/can ${SRC}/app)
 target_compile_definitions(host_tests PRIVATE _GNU_SOURCE)
 target_compile_options(host_tests PRIVATE -Wall -Wextra -Wno-unused-parameter
                        -fsanitize=address,undefined -fno-omit-frame-pointer)

@@ -15,7 +15,8 @@ eve_status_t dashboard_draw_splash(const char *fw_version, uint32_t chip_id);
  * Everything except rpm is drawn from `base`. Blocks for `duration_ms`. */
 eve_status_t dashboard_needle_sweep(const dash_data_t *base, uint32_t duration_ms);
 
-/* Draw one frame of the main gauge screen. `now_ms` drives blinking. */
-eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms);
+/* Draw one frame of the main gauge screen. Values not flagged in d->valid
+ * are drawn as "--"; d->link picks the status line. `now_ms` drives blinking. */
+eve_status_t dashboard_draw(const dash_data_t *d, uint32_t now_ms);
 
 #endif /* DASHBOARD_H */

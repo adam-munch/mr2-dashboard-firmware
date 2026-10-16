@@ -42,14 +42,21 @@ int main(int argc, char **argv)
     err |= dump(dir, "splash");
 
     const dash_data_t cruise = {.rpm = 3450, .speed_kph = 96, .coolant_c = 89, .fuel_pct = 62,
-                                .battery_mv = 14200, .gear = 3};
-    dashboard_draw(&cruise, true, 0);
+                                .battery_mv = 14200, .gear = 3, .valid = DASH_VALID_ALL,
+                                .link = DASH_LINK_OK};
+    dashboard_draw(&cruise, 0);
     err |= dump(dir, "dashboard");
 
     const dash_data_t redline = {.rpm = 6900, .speed_kph = 188, .coolant_c = 108, .fuel_pct = 9,
-                                 .battery_mv = 11800, .gear = 4};
-    dashboard_draw(&redline, true, 0);
+                                 .battery_mv = 11800, .gear = 4, .valid = DASH_VALID_ALL,
+                                 .warnings = DASH_WARN_CHECK_ENGINE | DASH_WARN_LIMITER,
+                                 .link = DASH_LINK_OK};
+    dashboard_draw(&redline, 0);
     err |= dump(dir, "dashboard_warnings");
+
+    const dash_data_t no_ecu = {.valid = 0, .link = DASH_LINK_LOST};
+    dashboard_draw(&no_ecu, 0);
+    err |= dump(dir, "dashboard_no_ecu");
 
     return err;
 }

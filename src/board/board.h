@@ -22,6 +22,15 @@
  *   11-14 GPIO0..3    EVE GPIOs     (unused)
  *   17,18 VBL         backlight     3.3 V or 5 V, 760 mA @ 3.3 V
  *   19,20 GND         GND           GND
+ *
+ * CAN bus to the ECU, through a 3.3 V CAN transceiver (TJA1051T/3,
+ * SN65HVD230, MCP2562 with VIO = 3.3 V, ...):
+ *
+ *   Transceiver pin   MCU pin (default)
+ *   ---------------   ------------------------------
+ *   TXD               PB9  FDCAN1_TX (AF3)
+ *   RXD               PB8  FDCAN1_RX (AF3)
+ *   S / STBY / Rs     tie low, or see BOARD_HAS_CAN_STBY
  */
 #ifndef BOARD_H
 #define BOARD_H
@@ -36,8 +45,20 @@
  * Clock
  * ------------------------------------------------------------------------ */
 
-/* SYSCLK = HCLK = PCLK = 64 MHz from HSI16 via the PLL (see clock.c). */
+/* SYSCLK = HCLK = PCLK = 64 MHz from the PLL (see clock.c). */
 #define BOARD_SYSCLK_HZ 64000000u
+
+/*
+ * External crystal on PF0-OSC_IN / PF1-OSC_OUT, in Hz: a multiple of 4 MHz
+ * from 4 to 32 MHz (8 MHz is typical). 0 = no crystal, run from HSI16.
+ *
+ * CAN needs an accurate clock. HSI16 is only +/-1 %, which uses up most of
+ * the CAN bit-timing tolerance, so a board on the bus should have a crystal.
+ * If the crystal doesn't start, clock.c falls back to HSI16 and says so on
+ * the debug UART.
+ */
+#define BOARD_HSE_HZ     0u
+#define BOARD_HSE_BYPASS 0 /* 1: an oscillator drives OSC_IN instead of a crystal */
 
 /* ---------------------------------------------------------------------------
  * EVE display (FT812) on SPI1
@@ -76,6 +97,33 @@
  */
 #define EVE_SPI_PRESC_INIT  SPI_PRESC_DIV8   /* 8 MHz  */
 #define EVE_SPI_PRESC_RUN   SPI_PRESC_DIV4   /* 16 MHz */
+
+/* ---------------------------------------------------------------------------
+ * CAN bus to the ECU (FDCAN1). Other options on this package: PA11/PA12
+ * (also USB) or PD0/PD1, all AF3. FDCAN2 works too: it is on PB0/PB1 (used
+ * by the display here), PB5/PB6 or PB12/PB13, AF3.
+ * ------------------------------------------------------------------------ */
+
+#define CAN_FDCAN    FDCAN1
+
+#define CAN_RX_PORT  GPIOB
+#define CAN_RX_PIN   8u
+#define CAN_RX_AF    3u
+
+#define CAN_TX_PORT  GPIOB
+#define CAN_TX_PIN   9u
+#define CAN_TX_AF    3u
+
+/*
+ * Transceiver standby / silent pin (TJA1051 "S", MCP2562 "STBY",
+ * SN65HVD230 "Rs"). All of these need it low to talk on the bus. Off by
+ * default so an unknown pin is never driven: tie the pin low on the board,
+ * or set this to 1 and fix the pin.
+ */
+#define BOARD_HAS_CAN_STBY 0
+
+#define CAN_STBY_PORT GPIOB
+#define CAN_STBY_PIN  7u
 
 /* ---------------------------------------------------------------------------
  * Debug UART (TX only, 115200 8N1). printf() goes here.
