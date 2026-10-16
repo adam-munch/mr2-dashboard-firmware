@@ -348,6 +348,7 @@ typedef struct {
     bool ends_with_display_swap;
     bool parse_error;
     int texts;
+    int needle_hits; /* CMD_TEXT strings equal to the needle */
 } stream_stats_t;
 
 /* Number of words a string argument occupies (NUL included, padded). */
@@ -363,7 +364,25 @@ static size_t str_words(size_t at)
     }
 }
 
-static stream_stats_t parse_stream(void)
+/* Display list words the co-processor emits for `chars` glyphs: one CELL and
+ * one VERTEX2F each past x = 511 (VERTEX2II can't reach), plus setup. */
+static size_t glyph_dl_words(size_t chars)
+{
+    return 8 + 2 * chars;
+}
+
+static size_t number_chars(int32_t n)
+{
+    size_t chars = n < 0 ? 2 : 1;
+    for (int64_t v = n < 0 ? -(int64_t)n : n; v >= 10; v /= 10) {
+        chars++;
+    }
+    return chars;
+}
+
+/* Walk the captured co-processor stream. If `needle` is set, count the
+ * CMD_TEXT strings that match it exactly. */
+static stream_stats_t parse_stream(const char *needle)
 {
     stream_stats_t s = {0};
     const size_t n = mock_fifo_words();
@@ -379,14 +398,19 @@ static stream_stats_t parse_stream(void)
             case CMD_SWAP:
                 i += 1;
                 break;
-            case CMD_TEXT:
+            case CMD_TEXT: {
+                const char *str = (const char *)&g_mock.fifo[(i + 3) * 4];
                 s.texts++;
-                s.dl_words += 8 + str_words(i + 3);
+                s.dl_words += glyph_dl_words(strlen(str));
+                if (needle != NULL && strcmp(str, needle) == 0) {
+                    s.needle_hits++;
+                }
                 i += 3 + str_words(i + 3);
                 break;
+            }
             case CMD_NUMBER:
                 s.texts++;
-                s.dl_words += 12;
+                s.dl_words += glyph_dl_words(number_chars((int32_t)mock_fifo_word(i + 3)));
                 i += 4;
                 break;
             case CMD_GRADIENT:
@@ -437,7 +461,7 @@ static stream_stats_t parse_stream(void)
 
 static void check_frame(const char *name)
 {
-    const stream_stats_t s = parse_stream();
+    const stream_stats_t s = parse_stream(NULL);
     printf("  %s: %zu FIFO words (%zu bytes), ~%zu DL words, %d vertices, %d text items\n", name, s.words,
            s.words * 4, s.dl_words, s.vertices, s.texts);
     CHECK(!s.parse_error);
@@ -449,11 +473,31 @@ static void check_frame(const char *name)
     CHECK(s.dl_words < RAM_DL_SIZE / 4); /* fits in the 8 KB display list */
 }
 
+/* How many times `text` is drawn in the captured frame. */
+static int frame_text_count(const char *text)
+{
+    return parse_stream(text).needle_hits;
+}
+
+/* Number of vertices in the captured frame. */
+static int frame_vertices(void)
+{
+    return parse_stream(NULL).vertices;
+}
+
 static void test_render_splash(void)
 {
-    init_ok();
-    CHECK_EQ(dashboard_draw_splash("0.1.0", 0x00011208u), EVE_OK);
-    check_frame("splash");
+    int vertices[3];
+    static const uint32_t lights[3] = {0, DASHBOARD_START_LIGHTS, 99};
+    for (size_t i = 0; i < 3; i++) {
+        init_ok();
+        CHECK_EQ(dashboard_draw_splash("0.1.0", 0x00011208u, lights[i]), EVE_OK);
+        check_frame("splash");
+        vertices[i] = frame_vertices();
+    }
+    /* Each lit start light adds its glow; out-of-range counts clamp. */
+    CHECK_EQ(vertices[1] - vertices[0], DASHBOARD_START_LIGHTS);
+    CHECK_EQ(vertices[2], vertices[1]);
 }
 
 static void test_render_dashboard(void)
@@ -464,20 +508,84 @@ static void test_render_dashboard(void)
         {.rpm = 8000, .speed_kph = 240, .coolant_c = 125, .fuel_pct = 100, .battery_mv = 16500, .gear = 5},
         {.rpm = 9999, .speed_kph = 999, .coolant_c = 999, .fuel_pct = 255, .battery_mv = 65535, .gear = 5},
     };
+    /* Both phases of the shift-light and alert flashing. */
+    static const uint32_t times[] = {0, 100, 250};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        init_ok();
-        CHECK_EQ(dashboard_draw(&cases[i], true, 1234), EVE_OK);
-        char name[32];
-        snprintf(name, sizeof name, "dashboard #%zu", i);
-        check_frame(name);
+        for (size_t t = 0; t < sizeof times / sizeof times[0]; t++) {
+            init_ok();
+            CHECK_EQ(dashboard_draw(&cases[i], true, times[t]), EVE_OK);
+            char name[48];
+            snprintf(name, sizeof name, "dashboard #%zu at %u ms", i, (unsigned)times[t]);
+            check_frame(name);
+        }
     }
 }
 
-static void test_needle_sweep(void)
+static void test_dashboard_alerts(void)
+{
+    const dash_data_t normal = {.rpm = 3000, .speed_kph = 90, .coolant_c = 88, .fuel_pct = 60,
+                                .battery_mv = 14100, .gear = 4};
+
+    /* All normal: no alert, no status words. */
+    init_ok();
+    CHECK_EQ(dashboard_draw(&normal, false, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("LOW FUEL"), 0);
+    CHECK_EQ(frame_text_count("COOLANT HOT"), 0);
+    CHECK_EQ(frame_text_count("NOT CHARGING"), 0);
+    CHECK_EQ(frame_text_count("COLD"), 0);
+    CHECK_EQ(frame_text_count("DEMO DATA"), 0);
+
+    /* One warning. */
+    dash_data_t d = normal;
+    d.fuel_pct = 14;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, true, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("LOW FUEL"), 1);
+    CHECK_EQ(frame_text_count("LOW"), 1); /* on the tile */
+    CHECK_EQ(frame_text_count("DEMO DATA"), 1);
+
+    /* Critical outranks warnings, and the rest are counted. */
+    d.coolant_c = 110;
+    d.battery_mv = 12400; /* engine running, so: not charging */
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, false, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("COOLANT HOT  +2"), 1);
+    CHECK_EQ(frame_text_count("HOT"), 1);
+    CHECK_EQ(frame_text_count("NO CHG"), 1);
+
+    /* Critical alerts flash at 2 Hz; the tiles keep their status. */
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, false, 250), EVE_OK);
+    CHECK_EQ(frame_text_count("COOLANT HOT  +2"), 0);
+    CHECK_EQ(frame_text_count("HOT"), 1);
+
+    /* Low voltage with the engine off is only a flat battery... */
+    d = normal;
+    d.rpm = 0;
+    d.battery_mv = 12400;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, false, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("NOT CHARGING"), 0);
+
+    /* ...and a cold engine is information, not an alert. */
+    d = normal;
+    d.coolant_c = 30;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, false, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("COLD"), 1);
+    init_ok();
+    CHECK_EQ(dashboard_draw(&normal, false, 0), EVE_OK);
+    const int normal_texts = parse_stream(NULL).texts;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, false, 0), EVE_OK);
+    CHECK_EQ(parse_stream(NULL).texts, normal_texts + 1); /* just the word, no alert */
+}
+
+static void test_rev_sweep(void)
 {
     init_ok();
     const dash_data_t base = {.rpm = 0, .speed_kph = 0, .coolant_c = 25, .fuel_pct = 50, .battery_mv = 12600};
-    CHECK_EQ(dashboard_needle_sweep(&base, 300), EVE_OK);
+    CHECK_EQ(dashboard_rev_sweep(&base, 300), EVE_OK);
     CHECK(mock_fifo_words() > 0);
 }
 
@@ -546,7 +654,8 @@ int main(void)
     RUN(test_deferred_error);
     RUN(test_render_splash);
     RUN(test_render_dashboard);
-    RUN(test_needle_sweep);
+    RUN(test_dashboard_alerts);
+    RUN(test_rev_sweep);
     RUN(test_fixmath);
     RUN(test_demo_data);
 

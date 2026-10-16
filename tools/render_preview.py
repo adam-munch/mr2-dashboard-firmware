@@ -3,8 +3,8 @@
 Approximate PNG preview of an FT81x co-processor command stream.
 
 Understands only what this firmware draws: POINTS, LINES, LINE_STRIP,
-RECTS, colours, CMD_GRADIENT (vertical), CMD_TEXT/CMD_NUMBER and
-CMD_ROMFONT. Text uses a TrueType stand-in for the EVE ROM fonts, so
+RECTS, colours and COLOR_A, CMD_GRADIENT (vertical), CMD_TEXT/CMD_NUMBER
+and CMD_ROMFONT. Text uses a TrueType stand-in for the EVE ROM fonts, so
 glyph shapes and widths are only roughly right. Check the real panel
 before trusting fine details.
 
@@ -57,6 +57,7 @@ class Renderer:
         self.img = Image.new("RGB", (WIDTH * SS, HEIGHT * SS))
         self.draw = ImageDraw.Draw(self.img)
         self.color = (255, 255, 255)
+        self.alpha = 255
         self.clear_color = (0, 0, 0)
         self.point_size = 16
         self.line_width = 16
@@ -65,25 +66,50 @@ class Renderer:
         self.handles = {}
 
     def end_primitive(self):
-        d, v = self.draw, self.verts
+        # Like the hardware, colour, alpha and sizes are latched per vertex.
+        # Opaque shapes go straight to the image; a run of translucent ones
+        # is drawn on a layer and blended in before the next shape.
+        layer = None
+        layer_alpha = 255
+
+        def flush():
+            nonlocal layer
+            if layer is not None:
+                mask = layer.getchannel("A").point(lambda px: px * layer_alpha // 255)
+                self.img.paste(layer.convert("RGB"), (0, 0), mask)
+                layer = None
+
+        def canvas(alpha):
+            nonlocal layer, layer_alpha
+            if alpha != layer_alpha or alpha == 255:
+                flush()
+            layer_alpha = alpha
+            if alpha == 255:
+                return self.draw
+            if layer is None:
+                layer = Image.new("RGBA", self.img.size, (0, 0, 0, 0))
+            return ImageDraw.Draw(layer)
+
+        v = self.verts
         if self.prim == POINTS:
-            for x, y, c, ps, _ in v:
+            for x, y, c, a, ps, _ in v:
                 r = ps / 16 * SS
-                d.ellipse([x * SS - r, y * SS - r, x * SS + r, y * SS + r], fill=c)
+                canvas(a).ellipse([x * SS - r, y * SS - r, x * SS + r, y * SS + r], fill=c)
         elif self.prim in (LINES, LINE_STRIP):
             step = 2 if self.prim == LINES else 1
             for k in range(0, len(v) - 1, step):
-                a, b = v[k], v[k + 1]
-                w = b[4] / 16 * SS
-                d.line([a[0] * SS, a[1] * SS, b[0] * SS, b[1] * SS], fill=b[2], width=max(1, round(2 * w)))
-                for p in (a, b):  # round caps
-                    d.ellipse([p[0] * SS - w, p[1] * SS - w, p[0] * SS + w, p[1] * SS + w], fill=b[2])
+                p, q = v[k], v[k + 1]
+                d, w = canvas(q[3]), q[5] / 16 * SS
+                d.line([p[0] * SS, p[1] * SS, q[0] * SS, q[1] * SS], fill=q[2], width=max(1, round(2 * w)))
+                for e in (p, q):  # round caps
+                    d.ellipse([e[0] * SS - w, e[1] * SS - w, e[0] * SS + w, e[1] * SS + w], fill=q[2])
         elif self.prim == RECTS:
             for k in range(0, len(v) - 1, 2):
-                a, b = v[k], v[k + 1]
-                r = b[4] / 16 * SS
-                d.rounded_rectangle([a[0] * SS - r, a[1] * SS - r, b[0] * SS + r, b[1] * SS + r],
-                                    radius=r, fill=b[2])
+                p, q = v[k], v[k + 1]
+                r = q[5] / 16 * SS
+                canvas(q[3]).rounded_rectangle([p[0] * SS - r, p[1] * SS - r, q[0] * SS + r, q[1] * SS + r],
+                                               radius=r, fill=q[2])
+        flush()
         self.verts = []
         self.prim = None
 
@@ -147,13 +173,15 @@ class Renderer:
                 x, y = (w >> 15) & 0x7FFF, w & 0x7FFF
                 x = x - 0x8000 if x & 0x4000 else x
                 y = y - 0x8000 if y & 0x4000 else y
-                self.verts.append((x / 16, y / 16, self.color, self.point_size, self.line_width))
+                self.verts.append((x / 16, y / 16, self.color, self.alpha, self.point_size, self.line_width))
             elif op == 0x02:
                 self.clear_color = rgb(w)
             elif op == 0x26:
                 self.draw.rectangle([0, 0, WIDTH * SS, HEIGHT * SS], fill=self.clear_color)
             elif op == 0x04:
                 self.color = rgb(w)
+            elif op == 0x10:
+                self.alpha = w & 0xFF
             elif op == 0x0D:
                 self.point_size = w & 0x1FFF
             elif op == 0x0E:

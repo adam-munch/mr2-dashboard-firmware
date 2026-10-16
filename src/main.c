@@ -2,7 +2,7 @@
  * MR2 dashboard firmware: STM32G0B1CBT6 driving a Newhaven
  * NHD-7.0-800480FT-CSXP (FT812 EVE) 7" display.
  *
- * Boot: splash -> backlight fade-in -> tach needle sweep -> live screen.
+ * Boot: splash -> backlight fade-in -> start lights -> rev sweep -> live screen.
  * Values come from a built-in simulation until real inputs are wired up.
  * If the display stops responding, it is re-initialised once a second.
  */
@@ -19,8 +19,8 @@
 #define FRAME_PERIOD_MS    16u  /* ~60 fps, matching the panel's 61.6 Hz */
 #define BACKLIGHT_DUTY     128u /* 0..128. Full brightness draws ~760 mA from VBL at 3.3 V */
 #define BACKLIGHT_FADE_MS  400u
-#define SPLASH_HOLD_MS     800u
-#define NEEDLE_SWEEP_MS    1500u
+#define START_LIGHT_MS     200u /* between start lights, and before lights out */
+#define REV_SWEEP_MS       1500u
 #define HEARTBEAT_MS       500u
 
 static void backlight_fade_in(uint8_t target, uint32_t duration_ms)
@@ -38,14 +38,26 @@ static eve_status_t run_dashboard(void)
     dash_data_t data;
     demo_data_init(&data, millis());
 
-    eve_status_t st = dashboard_draw_splash(FW_VERSION, eve_chip_id());
+    eve_status_t st = dashboard_draw_splash(FW_VERSION, eve_chip_id(), 0u);
     if (st != EVE_OK) {
         return st;
     }
     backlight_fade_in(BACKLIGHT_DUTY, BACKLIGHT_FADE_MS);
-    delay_ms(SPLASH_HOLD_MS);
 
-    st = dashboard_needle_sweep(&data, NEEDLE_SWEEP_MS);
+    for (uint32_t lights = 1u; lights <= DASHBOARD_START_LIGHTS; lights++) {
+        delay_ms(START_LIGHT_MS);
+        st = eve_cmd_wait_idle(100u);
+        if (st == EVE_OK) {
+            st = dashboard_draw_splash(FW_VERSION, eve_chip_id(), lights);
+        }
+        if (st != EVE_OK) {
+            return st;
+        }
+    }
+    delay_ms(START_LIGHT_MS);
+
+    /* Lights out. */
+    st = dashboard_rev_sweep(&data, REV_SWEEP_MS);
     if (st != EVE_OK) {
         return st;
     }

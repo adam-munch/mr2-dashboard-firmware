@@ -6,23 +6,56 @@ display. The display has an FT812 EVE graphics controller on board, so the MCU
 sends compact display-list commands over SPI. The FT812 does the rendering;
 there's no frame buffer on the MCU.
 
-![Dashboard preview](docs/dashboard-preview.png)
+![Dashboard preview: cruising](docs/dashboard-preview.png)
 
-*Approximate preview, rendered on a PC from the firmware's real command stream
-by `tools/render_preview.py`. The fonts are stand-ins for the EVE ROM fonts.*
+![Dashboard preview: at the shift point with three alerts](docs/dashboard-preview-alerts.png)
+
+*Approximate previews, rendered on a PC from the firmware's real command stream
+by `tools/render_preview.py`. The fonts are stand-ins for the EVE ROM fonts.
+Top: cruising, everything normal. Bottom: at the shift point, with an
+overheating engine, low fuel and low battery.*
 
 ## What it does
 
 1. Brings up the clock (64 MHz from HSI16), SysTick, SPI1 and a debug UART.
 2. Resets and initialises the FT812 using the timing from the NHD datasheet.
-3. Shows a splash screen, fades the backlight in and sweeps the tach needle.
-4. Runs the gauge screen at about 60 fps: a tachometer with redline, a shift
-   light, speed, gear, and coolant/fuel/battery bars.
+3. Shows a splash screen, fades the backlight in, runs five F1-style start
+   lights, and on "lights out" sweeps the rev bar to the stop and back.
+4. Runs the main screen at about 60 fps (see [Screen](#screen)).
 
 The values come from a built-in simulation (`src/app/demo_data.c`) until real
 inputs are connected, and the screen shows "DEMO DATA" while it runs. If the
 display stops responding (cable unplugged, co-processor fault), the firmware
 logs it and re-initialises once a second.
+
+## Screen
+
+The layout borrows from F1 steering-wheel displays. Colour always means
+something: while everything is normal the screen is monochrome apart from the
+shift lights, and a value only turns blue, amber or red when it needs
+attention.
+
+| Element | What it shows |
+|---|---|
+| Shift lights | 15 LEDs across the top in green, red and purple groups. The first lights at 4500 rpm, one more about every 140 rpm, and at 6500 rpm all of them flash purple |
+| Rev bar | 0–8000 rpm in 250 rpm segments, with the redline zone (7000+) tinted red |
+| Gear | Centre box. Its frame takes the colour of the shift lights, and the whole box flashes purple at the shift point, so the cue is also in central vision. Neutral shows a green N |
+| Speed, rpm | Either side of the gear. rpm turns red past the redline |
+| Alert | Appears under the gear only when something is wrong: the most severe message, plus a count of any others (`COOLANT HOT  +2`). Critical ones flash |
+| Coolant, fuel, battery | Tiles along the bottom. Each bar has its danger zone tinted, and the tile shows a status word and accent colour only when the value is out of range |
+
+Thresholds (all in `src/app/dashboard.c`):
+
+| Value | Status | Alert |
+|---|---|---|
+| Coolant < 60 °C | `COLD`, blue | none: it's information, not a fault |
+| Coolant > 100 °C | `HIGH`, amber | `COOLANT HIGH` |
+| Coolant > 105 °C | `HOT`, red | `COOLANT HOT` (critical) |
+| Fuel < 15 % | `LOW`, amber | `LOW FUEL` |
+| Fuel < 5 % | `EMPTY`, red | `FUEL EMPTY` (critical) |
+| Battery < 11.8 V | `LOW`, amber | `BATTERY LOW` |
+| Battery > 15.0 V | `HIGH`, amber | `VOLTAGE HIGH` |
+| Battery < 13.0 V with the engine running | `NO CHG`, amber | `NOT CHARGING` |
 
 ## Hardware
 
@@ -129,6 +162,7 @@ the chip does. The tests check:
 - the register values from the datasheet
 - command-FIFO chunking and fault recovery
 - every rendered frame: well-formed, on-screen, and small enough for the 8 KB display list
+- which alerts and status words the dashboard shows, and their priority and flashing
 
 ```sh
 cmake -S tests -B build-tests -G Ninja
@@ -174,7 +208,7 @@ tools/render_preview.py approximate PNG renderer for command streams
   two FDCAN controllers, ADCs and timers for pulse inputs. CAN needs an
   accurate clock: fit an HSE crystal and switch `clock_init()` to it, because
   HSI16 (±1 %) is too loose.
-- **Throughput.** The SPI driver is polled. A frame is about 1.5 KB, roughly
+- **Throughput.** The SPI driver is polled. A frame is under 2 KB, roughly
   1 ms at 16 MHz, so DMA is a later optimisation and not needed yet.
 - **Not used yet.** Touch (this module has no panel fitted, so the touch
   engine is switched off), audio (AUDIO_L needs the datasheet's filter and
