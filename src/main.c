@@ -2,7 +2,9 @@
  * MR2 dashboard firmware: STM32G0B1CBT6 driving a Newhaven
  * NHD-7.0-800480FT-CSXP (FT812 EVE) 7" display.
  *
- * Boot: splash -> backlight fade-in -> start lights -> rev sweep -> live screen.
+ * Boot: splash -> backlight fade-in -> start lights -> rev sweep -> live screen,
+ * which guides the driver through starting the engine (e-stop, steering
+ * wheel, start button) and then shows the gauges.
  * Values come from a built-in simulation until real inputs are wired up.
  * If the display stops responding, it is re-initialised once a second.
  */
@@ -61,6 +63,10 @@ static eve_status_t run_dashboard(void)
     if (st != EVE_OK) {
         return st;
     }
+
+    /* Start the simulation (and its start procedure) as the live screen,
+     * beginning with the pre-start guide, comes up. */
+    demo_data_init(&data, millis());
 
     uint32_t last_frame = millis();
     uint32_t last_beat = last_frame;

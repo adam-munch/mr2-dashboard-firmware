@@ -3,15 +3,14 @@
 #include <stdio.h>
 
 #include "eve_hal.h"
+#include "guide.h"
 #include "logo.h"
-
-#define SCREEN_W 800
-#define SCREEN_H 480
+#include "ui.h"
 
 /*
- * F1-style layout. Colour means something or isn't used: while everything is
- * normal the screen is monochrome apart from the shift lights, and a value
- * only turns blue, amber or red when it needs attention.
+ * F1-style layout. While everything is normal the screen is monochrome apart
+ * from the shift lights; a value only turns blue, amber or red when it needs
+ * attention (see ui.h).
  *
  *   +----------------------------------------------------------------+
  *   | shift lights: green, red, purple; all flash at the shift point |
@@ -24,41 +23,11 @@
  *   +----------------------------------------------------------------+
  */
 
-/* Colours (0xRRGGBB) */
-#define COL_BG         0x000000u
-#define COL_PANEL      0x0E1218u
-#define COL_PANEL_EDGE 0x262E38u
-#define COL_TRACK      0x1A2029u
-#define COL_BAR        0xD2DAE3u /* lit rev bar: a touch softer than the LEDs */
-#define COL_TEXT       0xFFFFFFu
-#define COL_TEXT_DIM   0x808B99u
-#define COL_TEXT_FAINT 0x55606Eu
-#define COL_RED        0xE10600u
-#define COL_RED_DARK   0x3A0A08u
-#define COL_GREEN      0x00D26Au
-#define COL_GREEN_DARK 0x06261Au
-#define COL_AMBER      0xFFB000u
-#define COL_PURPLE     0xA64DFFu
-#define COL_PURPLE_DK  0x221236u
-#define COL_BLUE       0x2E9BFFu
-
-/* Fonts: 26..31 are the FT81x anti-aliased ROM fonts, smallest to largest.
- * 32..34 are bigger still but have to be attached to a bitmap handle. */
-#define FONT_TINY     26
-#define FONT_SMALL    27
-#define FONT_MEDIUM   28
-#define FONT_VALUE    31
-#define FONT_BIG      2  /* bitmap handle that ROM font 33 is attached to */
-#define FONT_BIG_ROM  33
-#define FONT_HUGE     1  /* ... and ROM font 34 */
-#define FONT_HUGE_ROM 34
-
 /* Engine and warning thresholds */
 #define RPM_MAX          8000u
 #define RPM_REDLINE      7000u
 #define RPM_SHIFT        6500u /* all shift lights lit and flashing */
 #define RPM_LEDS_START   4500u /* first shift light */
-#define RPM_RUNNING      400u  /* above this the alternator should be charging */
 #define COOLANT_COLD_C   60
 #define COOLANT_HIGH_C   100
 #define COOLANT_HOT_C    105
@@ -188,7 +157,8 @@ static vital_status_t battery_status(uint16_t mv, uint16_t rpm)
     if (mv > BATT_HIGH_MV) {
         return (vital_status_t){LEVEL_WARN, "HIGH", "VOLTAGE HIGH"};
     }
-    if (rpm >= RPM_RUNNING && mv < BATT_CHARGING_MV) {
+    /* With the engine running the alternator should be charging. */
+    if (rpm >= DASH_RPM_RUNNING && mv < BATT_CHARGING_MV) {
         return (vital_status_t){LEVEL_WARN, "NO CHG", "NOT CHARGING"};
     }
     return (vital_status_t){LEVEL_OK, NULL, NULL};
@@ -197,36 +167,6 @@ static vital_status_t battery_status(uint16_t mv, uint16_t rpm)
 /* ---------------------------------------------------------------------------
  * Drawing helpers
  * ------------------------------------------------------------------------ */
-
-/* One rounded rectangle inside BEGIN(RECTS), outer edge at the given pixels.
- * RECTS grows each corner outwards by LINE_WIDTH, so this insets by `radius`;
- * LINE_WIDTH must already be radius * 16. */
-static void rect_vertices(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t radius)
-{
-    eve_cmd(VERTEX2F((x0 + radius) * 16, (y0 + radius) * 16));
-    eve_cmd(VERTEX2F((x1 - radius) * 16, (y1 - radius) * 16));
-}
-
-/* Filled rectangle with rounded corners, outer edge at the given pixels. */
-static void draw_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t rgb, int32_t radius)
-{
-    if (x1 - x0 < 2 * radius || y1 - y0 < 2 * radius) {
-        return;
-    }
-    eve_color(rgb);
-    eve_cmd(LINE_WIDTH(radius * 16));
-    eve_cmd(BEGIN(RECTS));
-    rect_vertices(x0, y0, x1, y1, radius);
-    eve_cmd(END());
-}
-
-/* The largest ROM font is fairly light; overstrike it for a heavier stroke. */
-static void draw_text_heavy(int16_t x, int16_t y, int16_t font, const char *s)
-{
-    for (int16_t dx = -1; dx <= 1; dx++) {
-        eve_cmd_text((int16_t)(x + dx), y, font, OPT_CENTER, s);
-    }
-}
 
 static uint32_t clamp_permille(int32_t value, int32_t lo, int32_t hi)
 {
@@ -237,12 +177,6 @@ static uint32_t clamp_permille(int32_t value, int32_t lo, int32_t hi)
         return 1000u;
     }
     return (uint32_t)((value - lo) * 1000 / (hi - lo));
-}
-
-/* Left edge of item `i` of `n` spread across x0..x1 with `gap` pixels between. */
-static int32_t spread_x(uint32_t i, uint32_t n, int32_t x0, int32_t x1, int32_t gap)
-{
-    return x0 + (int32_t)i * (x1 - x0 + gap) / (int32_t)n;
 }
 
 /* ---------------------------------------------------------------------------
@@ -295,20 +229,20 @@ static void draw_shift_lights(uint32_t rpm, bool flash_on)
     eve_cmd(COLOR_A(70));
     eve_cmd(LINE_WIDTH((r + LED_GLOW) * 16));
     for (uint32_t i = 0u; i < lit; i++) {
-        const int32_t x0 = spread_x(i, LED_COUNT, LED_X0, LED_X1, LED_GAP);
-        const int32_t x1 = spread_x(i + 1u, LED_COUNT, LED_X0, LED_X1, LED_GAP) - LED_GAP;
+        const int32_t x0 = ui_spread_x(i, LED_COUNT, LED_X0, LED_X1, LED_GAP);
+        const int32_t x1 = ui_spread_x(i + 1u, LED_COUNT, LED_X0, LED_X1, LED_GAP) - LED_GAP;
         eve_color(shift ? COL_PURPLE : led_colour(i, true));
-        rect_vertices(x0 - LED_GLOW, LED_Y0 - LED_GLOW, x1 + LED_GLOW, LED_Y1 + LED_GLOW, r + LED_GLOW);
+        ui_rect_vertices(x0 - LED_GLOW, LED_Y0 - LED_GLOW, x1 + LED_GLOW, LED_Y1 + LED_GLOW, r + LED_GLOW);
     }
     eve_cmd(COLOR_A(255));
 
     /* ...then the LEDs. Unlit ones keep a dark tint of their colour. */
     eve_cmd(LINE_WIDTH(r * 16));
     for (uint32_t i = 0u; i < LED_COUNT; i++) {
-        const int32_t x0 = spread_x(i, LED_COUNT, LED_X0, LED_X1, LED_GAP);
-        const int32_t x1 = spread_x(i + 1u, LED_COUNT, LED_X0, LED_X1, LED_GAP) - LED_GAP;
+        const int32_t x0 = ui_spread_x(i, LED_COUNT, LED_X0, LED_X1, LED_GAP);
+        const int32_t x1 = ui_spread_x(i + 1u, LED_COUNT, LED_X0, LED_X1, LED_GAP) - LED_GAP;
         eve_color(shift && i < lit ? COL_PURPLE : led_colour(i, i < lit));
-        rect_vertices(x0, LED_Y0, x1, LED_Y1, r);
+        ui_rect_vertices(x0, LED_Y0, x1, LED_Y1, r);
     }
     eve_cmd(END());
 }
@@ -328,16 +262,16 @@ static void draw_rev_bar(uint32_t rpm)
         } else {
             eve_color(red ? COL_RED_DARK : COL_TRACK);
         }
-        const int32_t x0 = spread_x(i, REV_SEGS, REV_X0, REV_X1, REV_GAP);
-        const int32_t x1 = spread_x(i + 1u, REV_SEGS, REV_X0, REV_X1, REV_GAP) - REV_GAP;
-        rect_vertices(x0, REV_Y0, x1, REV_Y1, 1);
+        const int32_t x0 = ui_spread_x(i, REV_SEGS, REV_X0, REV_X1, REV_GAP);
+        const int32_t x1 = ui_spread_x(i + 1u, REV_SEGS, REV_X0, REV_X1, REV_GAP) - REV_GAP;
+        ui_rect_vertices(x0, REV_Y0, x1, REV_Y1, 1);
     }
     eve_cmd(END());
 
     /* Scale in thousands, centred on the segment boundaries. */
     const uint32_t segs_per_k = REV_SEGS * 1000u / RPM_MAX;
     for (uint32_t k = 1u; k < RPM_MAX / 1000u; k++) {
-        const int32_t x = spread_x(k * segs_per_k, REV_SEGS, REV_X0, REV_X1, REV_GAP) - REV_GAP / 2;
+        const int32_t x = ui_spread_x(k * segs_per_k, REV_SEGS, REV_X0, REV_X1, REV_GAP) - REV_GAP / 2;
         eve_color(k * 1000u >= RPM_REDLINE ? COL_RED : COL_TEXT_FAINT);
         eve_cmd_number((int16_t)x, REV_Y1 + 14, FONT_TINY, OPT_CENTER, (int32_t)k);
     }
@@ -352,12 +286,12 @@ static void draw_gear(uint8_t gear, uint32_t rpm, bool flash_on)
     const bool shift_now = rpm >= RPM_SHIFT && flash_on;
 
     /* The frame follows the shift lights; at the shift point the box flashes. */
-    draw_rect(GEAR_X0, GEAR_Y0, GEAR_X1, GEAR_Y1, shift_stage_colour(rpm, COL_PANEL_EDGE), 10);
-    draw_rect(GEAR_X0 + 3, GEAR_Y0 + 3, GEAR_X1 - 3, GEAR_Y1 - 3, shift_now ? COL_PURPLE : COL_PANEL, 8);
+    ui_rect(GEAR_X0, GEAR_Y0, GEAR_X1, GEAR_Y1, shift_stage_colour(rpm, COL_PANEL_EDGE), 10);
+    ui_rect(GEAR_X0 + 3, GEAR_Y0 + 3, GEAR_X1 - 3, GEAR_Y1 - 3, shift_now ? COL_PURPLE : COL_PANEL, 8);
 
     const char gear_str[2] = {gear == 0u ? 'N' : (char)('0' + gear), '\0'};
     eve_color(gear == 0u && !shift_now ? COL_GREEN : COL_TEXT);
-    draw_text_heavy((GEAR_X0 + GEAR_X1) / 2, (GEAR_Y0 + GEAR_Y1) / 2, FONT_HUGE, gear_str);
+    ui_text_heavy((GEAR_X0 + GEAR_X1) / 2, (GEAR_Y0 + GEAR_Y1) / 2, FONT_HUGE, gear_str);
 }
 
 static void draw_speed_rpm(uint32_t speed_kph, uint32_t rpm)
@@ -398,7 +332,7 @@ static void draw_alert(const vital_status_t *s, uint32_t count, uint32_t now_ms)
     } else {
         snprintf(text, sizeof text, "%s", top->alert);
     }
-    draw_rect(ALERT_X0, ALERT_Y0, ALERT_X1, ALERT_Y1, level_colour(top->level), (ALERT_Y1 - ALERT_Y0) / 2);
+    ui_rect(ALERT_X0, ALERT_Y0, ALERT_X1, ALERT_Y1, level_colour(top->level), (ALERT_Y1 - ALERT_Y0) / 2);
     eve_color(COL_BG);
     eve_cmd_text((ALERT_X0 + ALERT_X1) / 2, (ALERT_Y0 + ALERT_Y1) / 2, FONT_SMALL, OPT_CENTER, text);
 }
@@ -425,8 +359,8 @@ static void draw_tile(uint32_t index, const tile_t *t)
     const bool ok = t->status.level == LEVEL_OK;
     const uint32_t colour = level_colour(t->status.level);
 
-    draw_rect(x0, TILE_Y0, x1, TILE_Y1, COL_PANEL, 8);
-    draw_rect(x0, TILE_Y0 + 14, x0 + 4, TILE_Y1 - 14, ok ? COL_PANEL_EDGE : colour, 2);
+    ui_rect(x0, TILE_Y0, x1, TILE_Y1, COL_PANEL, 8);
+    ui_rect(x0, TILE_Y0 + 14, x0 + 4, TILE_Y1 - 14, ok ? COL_PANEL_EDGE : colour, 2);
 
     /* Label and unit */
     eve_color(COL_TEXT_DIM);
@@ -455,10 +389,10 @@ static void draw_tile(uint32_t index, const tile_t *t)
     const int32_t by0 = TILE_Y1 - 22;
     const int32_t by1 = by0 + 6;
     const uint32_t bw = (uint32_t)(bx1 - bx0);
-    draw_rect(bx0, by0, bx1, by1, COL_TRACK, 2);
-    draw_rect(bx0 + (int32_t)(t->zone_lo * bw / 1000u), by0, bx0 + (int32_t)(t->zone_hi * bw / 1000u), by1,
+    ui_rect(bx0, by0, bx1, by1, COL_TRACK, 2);
+    ui_rect(bx0 + (int32_t)(t->zone_lo * bw / 1000u), by0, bx0 + (int32_t)(t->zone_hi * bw / 1000u), by1,
               COL_RED_DARK, 2);
-    draw_rect(bx0, by0, bx0 + (int32_t)(t->fill * bw / 1000u), by1, colour, 2);
+    ui_rect(bx0, by0, bx0 + (int32_t)(t->fill * bw / 1000u), by1, colour, 2);
 }
 
 static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
@@ -546,21 +480,27 @@ eve_status_t dashboard_draw_splash(const char *fw_version, uint32_t chip_id, uin
     return eve_cmd_flush();
 }
 
-eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms)
+/* One frame of the pre-start guide, or of the main screen when there is no
+ * guide step to show or `guide` is false. */
+static eve_status_t draw_frame(const dash_data_t *d, bool demo, uint32_t now_ms, bool guide)
 {
-    const bool flash_on = ((now_ms / 100u) & 1u) == 0u; /* 5 Hz shift flash */
+    const guide_step_t step = guide ? guide_step(d) : GUIDE_NONE;
 
     eve_cmd_dlstart();
     eve_cmd(CLEAR_COLOR_RGB(0, 0, 0));
     eve_cmd(CLEAR(1, 1, 1));
-    eve_cmd_romfont(FONT_HUGE, FONT_HUGE_ROM);
-    eve_cmd_romfont(FONT_BIG, FONT_BIG_ROM);
 
-    draw_shift_lights(d->rpm, flash_on);
-    draw_rev_bar(d->rpm);
-    draw_speed_rpm(d->speed_kph, d->rpm);
-    draw_gear(d->gear, d->rpm, flash_on);
-    draw_vitals(d, now_ms);
+    if (step != GUIDE_NONE) {
+        guide_draw(d, step, now_ms);
+    } else {
+        const bool flash_on = ((now_ms / 100u) & 1u) == 0u; /* 5 Hz shift flash */
+        ui_attach_fonts();
+        draw_shift_lights(d->rpm, flash_on);
+        draw_rev_bar(d->rpm);
+        draw_speed_rpm(d->speed_kph, d->rpm);
+        draw_gear(d->gear, d->rpm, flash_on);
+        draw_vitals(d, now_ms);
+    }
 
     if (demo) {
         eve_color(COL_TEXT_FAINT);
@@ -570,6 +510,11 @@ eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms)
     eve_cmd(DISPLAY());
     eve_cmd_swap();
     return eve_cmd_flush();
+}
+
+eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms)
+{
+    return draw_frame(d, demo, now_ms, true);
 }
 
 eve_status_t dashboard_rev_sweep(const dash_data_t *base, uint32_t duration_ms)
@@ -590,7 +535,7 @@ eve_status_t dashboard_rev_sweep(const dash_data_t *base, uint32_t duration_ms)
          * waits for the previous swap, so this runs at the panel's frame rate. */
         eve_status_t st = eve_cmd_wait_idle(100u);
         if (st == EVE_OK) {
-            st = dashboard_draw(&d, false, start + t);
+            st = draw_frame(&d, false, start + t, false); /* always the gauges */
         }
         if (st != EVE_OK || t >= 2u * half) {
             return st;

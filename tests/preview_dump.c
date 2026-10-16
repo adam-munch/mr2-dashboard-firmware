@@ -65,5 +65,23 @@ int main(int argc, char **argv)
     dashboard_draw(&cold, true, 0);
     err |= dump(dir, "dashboard_cold");
 
+    /* Pre-start guide: one screen per step. */
+    dash_data_t parked = {.coolant_c = 24, .fuel_pct = 72, .battery_mv = 12500, .gear = 1,
+                          .estop_active = true};
+    dashboard_draw(&parked, true, 0);
+    err |= dump(dir, "guide_estop");
+
+    parked.estop_active = false;
+    dashboard_draw(&parked, true, 0);
+    err |= dump(dir, "guide_wheel");
+
+    parked.wheel_connected = true; /* still in gear, clutch up: start won't work */
+    dashboard_draw(&parked, true, 0);
+    err |= dump(dir, "guide_start_blocked");
+
+    parked.clutch_held = true;
+    dashboard_draw(&parked, true, 300);
+    err |= dump(dir, "guide_start_ready");
+
     return err;
 }

@@ -1,7 +1,12 @@
 #include "demo_data.h"
 
 /*
- * A repeating drive cycle: idle, pull through the gears, coast down
+ * First the start procedure: the car sits with the e-stop pressed in, no
+ * steering wheel and first gear still selected. The driver releases the
+ * e-stop, plugs the wheel in, holds the clutch (so the start button will
+ * work) and starts the engine.
+ *
+ * Then a repeating drive cycle: idle, pull through the gears, coast down
  * through the gears, idle again. Gearing is roughly an SW20 MR2 (E153
  * gearbox, 4.285 final drive, 225/50R15 rear tyres).
  */
@@ -20,7 +25,17 @@ static const uint16_t k_accel_rpm_s[6] = {0, 3500, 2200, 1500, 1000, 700};
 #define DECEL_RPM_S      1200u
 #define SHIFT_RPM_S      12000u /* how fast rpm settles during a gear change */
 
+/* Start procedure, ms after demo_data_init() */
+#define ESTOP_OFF_MS     3000u
+#define WHEEL_IN_MS      6000u
+#define CLUTCH_IN_MS     8500u /* until here the start button wouldn't work */
+#define CRANK_MS         10000u
+#define FIRE_MS          10800u
+#define CRANK_RPM        200u
+#define PARKED_MV        12500u
+
 typedef enum {
+    PHASE_PRESTART,
     PHASE_IDLE,
     PHASE_ACCEL,
     PHASE_DECEL,
@@ -52,15 +67,18 @@ static void start_shift(dash_data_t *d, uint8_t new_gear, phase_t after)
 
 void demo_data_init(dash_data_t *d, uint32_t now_ms)
 {
-    d->rpm = IDLE_RPM;
+    d->rpm = 0u;
     d->speed_kph = 0u;
     d->coolant_c = 25;
     d->fuel_pct = 72u;
-    d->battery_mv = 13800u;
-    d->gear = 0u;
+    d->battery_mv = PARKED_MV;
+    d->gear = 1u;
+    d->estop_active = true;
+    d->wheel_connected = false;
+    d->clutch_held = false;
 
-    s_phase = PHASE_IDLE;
-    s_rpm_x1000 = IDLE_RPM * 1000u;
+    s_phase = PHASE_PRESTART;
+    s_rpm_x1000 = 0u;
     s_speed_x10 = 0u;
     s_phase_start_ms = now_ms;
     s_last_ms = now_ms;
@@ -73,10 +91,26 @@ static void update_drivetrain(dash_data_t *d, uint32_t now_ms, uint32_t dt)
     const uint32_t rpm = s_rpm_x1000 / 1000u;
 
     switch (s_phase) {
+    case PHASE_PRESTART: {
+        const uint32_t t = now_ms - s_phase_start_ms;
+        d->estop_active = t < ESTOP_OFF_MS;
+        d->wheel_connected = t >= WHEEL_IN_MS;
+        d->clutch_held = t >= CLUTCH_IN_MS;
+        if (t >= FIRE_MS) {
+            s_rpm_x1000 = IDLE_RPM * 1000u;
+            s_phase = PHASE_IDLE; /* in first, clutch held, ready to go */
+            s_phase_start_ms = now_ms;
+        } else if (t >= CRANK_MS) {
+            s_rpm_x1000 = CRANK_RPM * 1000u + ((now_ms / 53u) % 60u) * 1000u; /* uneven cranking */
+        }
+        break;
+    }
+
     case PHASE_IDLE:
         s_rpm_x1000 = IDLE_RPM * 1000u + ((now_ms / 97u) % 30u) * 1000u; /* slight hunt */
         if ((uint32_t)(now_ms - s_phase_start_ms) >= IDLE_TIME_MS) {
             d->gear = 1u;
+            d->clutch_held = false;
             s_rpm_x1000 = 1500u * 1000u;
             s_phase = PHASE_ACCEL;
         }
@@ -98,6 +132,7 @@ static void update_drivetrain(dash_data_t *d, uint32_t now_ms, uint32_t dt)
         } else if (d->gear == 1u && rpm < STOP_RPM) {
             /* Clutch in, rolled to a stop. */
             d->gear = 0u;
+            d->clutch_held = true;
             s_rpm_x1000 = IDLE_RPM * 1000u;
             s_phase = PHASE_IDLE;
             s_phase_start_ms = now_ms;
@@ -120,15 +155,22 @@ static void update_drivetrain(dash_data_t *d, uint32_t now_ms, uint32_t dt)
     }
 
     d->rpm = (uint16_t)(s_rpm_x1000 / 1000u);
-    /* Road speed follows the revs, except mid-shift where it holds. */
+    /* Road speed follows the revs when the drive is engaged, except
+     * mid-shift where it holds. */
     if (s_phase != PHASE_SHIFT) {
-        s_speed_x10 = d->gear == 0u ? 0u : (uint32_t)d->rpm * k_kph_x10_per_krpm[d->gear] / 1000u;
+        const bool driven = d->gear != 0u && !d->clutch_held;
+        s_speed_x10 = driven ? (uint32_t)d->rpm * k_kph_x10_per_krpm[d->gear] / 1000u : 0u;
     }
     d->speed_kph = (uint16_t)((s_speed_x10 + 5u) / 10u);
 }
 
 static void update_gauges(dash_data_t *d, uint32_t dt)
 {
+    if (!dash_engine_running(d)) {
+        d->battery_mv = PARKED_MV;
+        return;
+    }
+
     /* Warm up 1 degC every 400 ms to 88 degC, then the thermostat holds it. */
     s_temp_acc_ms += dt;
     while (s_temp_acc_ms >= 400u) {

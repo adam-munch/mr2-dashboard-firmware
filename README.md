@@ -25,7 +25,9 @@ team logo, three start lights in.*
 3. Shows a splash screen with the team logo, fades the backlight in, runs five
    F1-style start lights, and on "lights out" sweeps the rev bar to the stop
    and back.
-4. Runs the main screen at about 60 fps (see [Screen](#screen)).
+4. Walks the driver through starting the engine, one screen per step (see
+   [Pre-start guide](#pre-start-guide)), then runs the main screen at about
+   60 fps (see [Screen](#screen)).
 
 The values come from a built-in simulation (`src/app/demo_data.c`) until real
 inputs are connected, and the screen shows "DEMO DATA" while it runs. If the
@@ -60,6 +62,33 @@ Thresholds (all in `src/app/dashboard.c`):
 | Battery < 11.8 V | `LOW`, amber | `BATTERY LOW` |
 | Battery > 15.0 V | `HIGH`, amber | `VOLTAGE HIGH` |
 | Battery < 13.0 V with the engine running | `NO CHG`, amber | `NOT CHARGING` |
+
+### Pre-start guide
+
+![Pre-start guide: e-stop, steering wheel, and the start step blocked and ready](docs/guide-preview.png)
+
+Starting the engine takes three things, in order: turn off the e-stop, plug
+in the steering wheel, press start. Until the engine runs, the screen shows
+the first one not done yet. A stepper along the top shows progress (done steps
+turn green), and each screen has an icon, the instruction, and the live state
+of the input it is waiting for. The screens follow the inputs, so a step that
+is undone again (e-stop pressed back in) brings its screen back.
+
+The start button only works in neutral or with the clutch held, so the start
+screen puts that rule in an amber-framed card with both conditions live:
+each turns green with a tick when met (the neutral one also shows the gear
+selected), and either one is enough. Below it the screen says `NOT READY`,
+`READY TO START` (the button's ring turns green and pulses) or `CRANKING`.
+
+The guide shows whenever the engine isn't running (below 400 rpm) and the
+car is stationary. If the engine stops while the car is still rolling, the
+gauges stay up, so speed stays visible, until the car stops.
+
+The inputs are `estop_active`, `wheel_connected` and `clutch_held` in
+`dash_data_t`, along with `gear` and `rpm`. The demo runs through the whole
+procedure after boot: e-stop released at 3 s, wheel in at 6 s, first gear
+still selected so start is blocked until the clutch goes down at 8.5 s, then
+cranking at 10 s and the engine catching at 10.8 s.
 
 ### Team logo
 
@@ -190,6 +219,9 @@ the chip does. The tests check:
 - every rendered frame: well-formed, on-screen, and small enough for the 8 KB display list
 - which alerts and status words the dashboard shows, and their priority and flashing
 - the logo outline (a simple polygon of the declared size) and its stencil fill
+- the pre-start guide: which step shows, the neutral-or-clutch rule and its
+  live state, and that the demo's start procedure runs in order and only
+  cranks when the rule allows it
 
 ```sh
 cmake -S tests -B build-tests -G Ninja
@@ -220,8 +252,10 @@ src/
     eve_hal_stm32.c     ... implemented for this board
     eve_panels.c        display timing for the NHD-7.0-800480FT-CSXP
   app/
-    dashboard.c         screen layout and drawing
-    demo_data.c         simulated engine data
+    dashboard.c         main screen and splash, and which screen to show
+    guide.c             pre-start guide screens
+    ui.c/.h             shared palette, fonts and drawing helpers
+    demo_data.c         simulated engine data, including the start procedure
     fixmath.c           integer sin/cos for the gauge geometry
     logo.c              team logo outline and its polygon fill
 linker/                 STM32G0B1CBTx linker script
@@ -236,7 +270,9 @@ tools/trace_logo.py     turns logo artwork into the outline table in logo.c
 - **Real inputs.** Replace `demo_data_update()` with real sources. The G0B1 has
   two FDCAN controllers, ADCs and timers for pulse inputs. CAN needs an
   accurate clock: fit an HSE crystal and switch `clock_init()` to it, because
-  HSI16 (±1 %) is too loose.
+  HSI16 (±1 %) is too loose. The e-stop, steering-wheel detect and clutch
+  switch are plain on/off signals, so spare GPIOs (or a CAN message from
+  whatever already reads them) will do.
 - **Throughput.** The SPI driver is polled. A frame is under 2 KB, roughly
   1 ms at 16 MHz, so DMA is a later optimisation and not needed yet.
 - **Not used yet.** Touch (this module has no panel fitted, so the touch

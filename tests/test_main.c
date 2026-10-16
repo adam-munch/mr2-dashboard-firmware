@@ -12,6 +12,7 @@
 #include "eve.h"
 #include "eve_panels.h"
 #include "fixmath.h"
+#include "guide.h"
 #include "logo.h"
 #include "mock_eve.h"
 
@@ -592,6 +593,95 @@ static void test_dashboard_alerts(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Pre-start guide
+ * ------------------------------------------------------------------------ */
+
+/* Draw `d` as one frame and run the usual frame checks on it. */
+static void draw_checked(const dash_data_t *d, const char *name)
+{
+    init_ok();
+    CHECK_EQ(dashboard_draw(d, true, 0), EVE_OK);
+    check_frame(name);
+}
+
+static void test_guide_screens(void)
+{
+    static const char *const rule = "Only starts in neutral or with the clutch held";
+    dash_data_t d = {.coolant_c = 20, .fuel_pct = 50, .battery_mv = 12500, .gear = 2, .estop_active = true};
+
+    /* Step 1 comes first, whatever else is already done. */
+    CHECK_EQ(guide_step(&d), GUIDE_ESTOP);
+    d.wheel_connected = true;
+    CHECK_EQ(guide_step(&d), GUIDE_ESTOP);
+    draw_checked(&d, "guide: e-stop");
+    CHECK_EQ(frame_text_count("TURN OFF THE E-STOP"), 1);
+    CHECK_EQ(frame_text_count("E-STOP ACTIVE"), 1);
+    CHECK_EQ(frame_text_count("KM/H"), 0); /* not the gauges */
+
+    /* Step 2 */
+    d.estop_active = false;
+    d.wheel_connected = false;
+    CHECK_EQ(guide_step(&d), GUIDE_WHEEL);
+    draw_checked(&d, "guide: wheel");
+    CHECK_EQ(frame_text_count("PLUG IN THE STEERING WHEEL"), 1);
+    CHECK_EQ(frame_text_count("WHEEL NOT DETECTED"), 1);
+
+    /* Step 3 in gear with the clutch up: the rule is spelled out, start won't work. */
+    d.wheel_connected = true;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+    CHECK(!guide_start_ready(&d));
+    draw_checked(&d, "guide: start, not ready");
+    CHECK_EQ(frame_text_count("PRESS START"), 1);
+    CHECK_EQ(frame_text_count(rule), 1);
+    CHECK_EQ(frame_text_count("NOT READY"), 1);
+    CHECK_EQ(frame_text_count("READY TO START"), 0);
+    CHECK_EQ(frame_text_count("2"), 1); /* the gear it's in */
+
+    /* Either condition is enough. */
+    d.clutch_held = true;
+    CHECK(guide_start_ready(&d));
+    draw_checked(&d, "guide: start, clutch held");
+    CHECK_EQ(frame_text_count(rule), 1); /* still shown */
+    CHECK_EQ(frame_text_count("READY TO START"), 1);
+    CHECK_EQ(frame_text_count("NOT READY"), 0);
+
+    d.clutch_held = false;
+    d.gear = 0;
+    CHECK(guide_start_ready(&d));
+    draw_checked(&d, "guide: start, neutral");
+    CHECK_EQ(frame_text_count("READY TO START"), 1);
+    CHECK_EQ(frame_text_count("N"), 1);
+
+    /* Cranking: still the start screen, saying so. */
+    d.rpm = 220;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+    draw_checked(&d, "guide: cranking");
+    CHECK_EQ(frame_text_count("CRANKING"), 1);
+    CHECK_EQ(frame_text_count("READY TO START"), 0);
+
+    /* Running: the gauges. */
+    d.rpm = DASH_RPM_RUNNING;
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    draw_checked(&d, "running");
+    CHECK_EQ(frame_text_count("KM/H"), 1);
+    CHECK_EQ(frame_text_count("PRESS START"), 0);
+
+    /* Stalled on the move: the gauges stay until the car stops. */
+    d.rpm = 0;
+    d.speed_kph = 40;
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    d.speed_kph = 0;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+
+    /* The rev sweep shows the gauges even where it passes 0 rpm. */
+    d.estop_active = true;
+    init_ok();
+    CHECK_EQ(dashboard_rev_sweep(&d, 10), EVE_OK);
+    CHECK(frame_text_count("KM/H") > 2);
+    CHECK_EQ(frame_text_count("TURN OFF THE E-STOP"), 0);
+}
+
+/* ---------------------------------------------------------------------------
  * Logo
  * ------------------------------------------------------------------------ */
 
@@ -757,18 +847,54 @@ static void test_demo_data(void)
     uint16_t max_speed = 0;
     bool sane = true;
 
+    /* The start procedure: the guide steps come in order, the engine only
+     * cranks once everything allows it, and it doesn't stall afterwards. */
+    guide_step_t last_step = guide_step(&d);
+    const bool starts_at_estop = last_step == GUIDE_ESTOP;
+    bool steps_in_order = true;
+    bool saw_start_blocked = false;
+    bool saw_start_ready = false;
+    bool cranked_when_not_allowed = false;
+    bool started = false;
+    bool stalled = false;
+
     for (uint32_t t = 0; t <= 120000; t += 16) { /* two minutes at 60 fps */
         demo_data_update(&d, t);
         saw_gear[d.gear] = true;
         max_rpm = d.rpm > max_rpm ? d.rpm : max_rpm;
         max_speed = d.speed_kph > max_speed ? d.speed_kph : max_speed;
-        sane = sane && d.gear <= 5 && d.rpm >= 500 && d.rpm <= 7500 && d.speed_kph <= 260 &&
-               d.fuel_pct <= 100 && d.coolant_c >= 20 && d.coolant_c <= 100;
-        if (d.gear == 0) {
+        sane = sane && d.gear <= 5 && d.rpm <= 7500 && d.speed_kph <= 260 && d.fuel_pct <= 100 &&
+               d.coolant_c >= 20 && d.coolant_c <= 100;
+        if (d.gear == 0 || d.clutch_held || !started) {
             sane = sane && d.speed_kph == 0;
+        }
+
+        const guide_step_t step = guide_step(&d);
+        steps_in_order = steps_in_order && (step == last_step || step == last_step + 1);
+        last_step = step;
+        if (step == GUIDE_START) {
+            saw_start_blocked = saw_start_blocked || !guide_start_ready(&d);
+            saw_start_ready = saw_start_ready || guide_start_ready(&d);
+        }
+        if (!started && d.rpm >= GUIDE_RPM_CRANKING) {
+            cranked_when_not_allowed =
+                cranked_when_not_allowed || d.estop_active || !d.wheel_connected || !guide_start_ready(&d);
+        }
+        if (dash_engine_running(&d)) {
+            started = true;
+        } else {
+            stalled = stalled || started;
         }
     }
     CHECK(sane);
+    CHECK(starts_at_estop);
+    CHECK(steps_in_order);
+    CHECK_EQ(last_step, GUIDE_NONE);
+    CHECK(saw_start_blocked); /* the demo shows the rule being enforced... */
+    CHECK(saw_start_ready);   /* ...and met */
+    CHECK(!cranked_when_not_allowed);
+    CHECK(started);
+    CHECK(!stalled);
     for (int g = 0; g <= 5; g++) {
         CHECK(saw_gear[g]);
     }
@@ -795,6 +921,7 @@ int main(void)
     RUN(test_render_splash);
     RUN(test_render_dashboard);
     RUN(test_dashboard_alerts);
+    RUN(test_guide_screens);
     RUN(test_logo_outline);
     RUN(test_logo_draw);
     RUN(test_rev_sweep);
