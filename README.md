@@ -10,17 +10,21 @@ there's no frame buffer on the MCU.
 
 ![Dashboard preview: at the shift point with three alerts](docs/dashboard-preview-alerts.png)
 
+![Splash preview: team logo and start lights](docs/splash-preview.png)
+
 *Approximate previews, rendered on a PC from the firmware's real command stream
 by `tools/render_preview.py`. The fonts are stand-ins for the EVE ROM fonts.
-Top: cruising, everything normal. Bottom: at the shift point, with an
-overheating engine, low fuel and low battery.*
+Top: cruising, everything normal. Middle: at the shift point, with an
+overheating engine, low fuel and low battery. Bottom: the boot splash with the
+team logo, three start lights in.*
 
 ## What it does
 
 1. Brings up the clock (64 MHz from HSI16), SysTick, SPI1 and a debug UART.
 2. Resets and initialises the FT812 using the timing from the NHD datasheet.
-3. Shows a splash screen, fades the backlight in, runs five F1-style start
-   lights, and on "lights out" sweeps the rev bar to the stop and back.
+3. Shows a splash screen with the team logo, fades the backlight in, runs five
+   F1-style start lights, and on "lights out" sweeps the rev bar to the stop
+   and back.
 4. Runs the main screen at about 60 fps (see [Screen](#screen)).
 
 The values come from a built-in simulation (`src/app/demo_data.c`) until real
@@ -56,6 +60,28 @@ Thresholds (all in `src/app/dashboard.c`):
 | Battery < 11.8 V | `LOW`, amber | `BATTERY LOW` |
 | Battery > 15.0 V | `HIGH`, amber | `VOLTAGE HIGH` |
 | Battery < 13.0 V with the engine running | `NO CHG`, amber | `NOT CHARGING` |
+
+### Team logo
+
+The splash logo is stored as its outline, not as a bitmap: 34 corner points,
+136 bytes of flash, and nothing loaded into the FT812's graphics RAM. The
+FT812 fills it with a stencil-buffer polygon fill (`EDGE_STRIP_B` with
+`INVERT`) inside the logo's box, then draws a 1 px line along the outline to
+anti-alias the edges, so it stays sharp at any size. A 320 px wide bitmap
+would take about 6 KB at 1 bit per pixel with jagged edges, or about 26 KB
+anti-aliased at 4 bits per pixel.
+
+To change the logo, trace the new artwork and paste the output into
+`src/app/logo.c` and `logo.h` (needs Pillow and NumPy):
+
+```sh
+tools/trace_logo.py new-logo.png
+```
+
+The artwork has to be one light shape with straight edges and no holes; the
+script says so if it isn't. It also reports how closely the outline matches the
+artwork. The host tests check that the outline is a simple polygon that fills
+the declared size.
 
 ## Hardware
 
@@ -163,6 +189,7 @@ the chip does. The tests check:
 - command-FIFO chunking and fault recovery
 - every rendered frame: well-formed, on-screen, and small enough for the 8 KB display list
 - which alerts and status words the dashboard shows, and their priority and flashing
+- the logo outline (a simple polygon of the declared size) and its stencil fill
 
 ```sh
 cmake -S tests -B build-tests -G Ninja
@@ -196,10 +223,12 @@ src/
     dashboard.c         screen layout and drawing
     demo_data.c         simulated engine data
     fixmath.c           integer sin/cos for the gauge geometry
+    logo.c              team logo outline and its polygon fill
 linker/                 STM32G0B1CBTx linker script
 third_party/            CMSIS core 5.9.0 and ST cmsis_device_g0 v1.4.5 (Apache-2.0)
 tests/                  host tests, mock FT812, preview dumper
 tools/render_preview.py approximate PNG renderer for command streams
+tools/trace_logo.py     turns logo artwork into the outline table in logo.c
 ```
 
 ## Notes and next steps

@@ -36,6 +36,7 @@ add_executable(${TARGET_NAME}
     src/app/dashboard.c
     src/app/demo_data.c
     src/app/fixmath.c
+    src/app/logo.c
     third_party/cmsis_device_g0/Source/system_stm32g0xx.c
     third_party/cmsis_device_g0/Source/gcc/startup_stm32g0b1xx.s
 )

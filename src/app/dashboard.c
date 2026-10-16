@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "eve_hal.h"
+#include "logo.h"
 
 #define SCREEN_W 800
 #define SCREEN_H 480
@@ -115,8 +116,11 @@
 #define TILE_GAP   12
 #define TILE_PAD   20
 
-/* Splash start lights */
-#define START_LIGHT_Y     318
+/* Splash: team logo, title, start lights */
+#define SPLASH_LOGO_W     320
+#define SPLASH_LOGO_Y     84
+#define SPLASH_TITLE_Y    288
+#define START_LIGHT_Y     352
 #define START_LIGHT_R     16
 #define START_LIGHT_PITCH 64
 
@@ -511,12 +515,10 @@ eve_status_t dashboard_draw_splash(const char *fw_version, uint32_t chip_id, uin
     eve_cmd_dlstart();
     eve_cmd(CLEAR_COLOR_RGB(0, 0, 0));
     eve_cmd(CLEAR(1, 1, 1));
-    eve_cmd_romfont(FONT_HUGE, FONT_HUGE_ROM);
 
-    eve_color(COL_TEXT);
-    draw_text_heavy(SCREEN_W / 2, 176, FONT_HUGE, "MR2");
+    logo_draw((SCREEN_W - SPLASH_LOGO_W) / 2, SPLASH_LOGO_Y, SPLASH_LOGO_W, COL_TEXT);
     eve_color(COL_TEXT_DIM);
-    eve_cmd_text(SCREEN_W / 2, 246, FONT_MEDIUM, OPT_CENTER, "DASHBOARD");
+    eve_cmd_text(SCREEN_W / 2, SPLASH_TITLE_Y, FONT_MEDIUM, OPT_CENTER, "MR2 DASHBOARD");
 
     /* Start lights: they come on one by one, and go out for the rev sweep. */
     const int32_t x_first = SCREEN_W / 2 - 2 * START_LIGHT_PITCH;

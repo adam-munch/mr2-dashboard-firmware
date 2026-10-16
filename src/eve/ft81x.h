@@ -165,17 +165,38 @@
 #define ONE_MINUS_SRC_ALPHA 4UL
 #define ONE_MINUS_DST_ALPHA 5UL
 
+/* Stencil test functions for STENCIL_FUNC() */
+#define NEVER    0UL
+#define LESS     1UL
+#define LEQUAL   2UL
+#define GREATER  3UL
+#define GEQUAL   4UL
+#define EQUAL    5UL
+#define NOTEQUAL 6UL
+#define ALWAYS   7UL
+
+/* Stencil operations for STENCIL_OP(), as well as ZERO above */
+#define KEEP    1UL
+#define REPLACE 2UL
+#define INCR    3UL
+#define DECR    4UL
+#define INVERT  5UL
+
 #define DISPLAY()             0x00000000UL
 #define CLEAR_COLOR_RGB(r, g, b) \
     ((0x02UL << 24) | (((uint32_t)(r) & 0xFFUL) << 16) | (((uint32_t)(g) & 0xFFUL) << 8) | ((uint32_t)(b) & 0xFFUL))
 #define TAG(s)                ((0x03UL << 24) | ((uint32_t)(s) & 0xFFUL))
 #define COLOR_RGB(r, g, b) \
     ((0x04UL << 24) | (((uint32_t)(r) & 0xFFUL) << 16) | (((uint32_t)(g) & 0xFFUL) << 8) | ((uint32_t)(b) & 0xFFUL))
+#define STENCIL_FUNC(func, ref, mask) \
+    ((0x0AUL << 24) | (((uint32_t)(func) & 0xFUL) << 16) | (((uint32_t)(ref) & 0xFFUL) << 8) | ((uint32_t)(mask) & 0xFFUL))
 #define BLEND_FUNC(src, dst)  ((0x0BUL << 24) | (((uint32_t)(src) & 7UL) << 3) | ((uint32_t)(dst) & 7UL))
+#define STENCIL_OP(sfail, spass) ((0x0CUL << 24) | (((uint32_t)(sfail) & 7UL) << 3) | ((uint32_t)(spass) & 7UL))
 #define POINT_SIZE(size)      ((0x0DUL << 24) | ((uint32_t)(size) & 0x1FFFUL))
 #define LINE_WIDTH(width)     ((0x0EUL << 24) | ((uint32_t)(width) & 0xFFFUL))
 #define CLEAR_COLOR_A(a)      ((0x0FUL << 24) | ((uint32_t)(a) & 0xFFUL))
 #define COLOR_A(a)            ((0x10UL << 24) | ((uint32_t)(a) & 0xFFUL))
+#define CLEAR_STENCIL(s)      ((0x11UL << 24) | ((uint32_t)(s) & 0xFFUL))
 #define TAG_MASK(mask)        ((0x14UL << 24) | ((uint32_t)(mask) & 1UL))
 #define SCISSOR_XY(x, y)      ((0x1BUL << 24) | (((uint32_t)(x) & 0x7FFUL) << 11) | ((uint32_t)(y) & 0x7FFUL))
 #define SCISSOR_SIZE(w, h)    ((0x1CUL << 24) | (((uint32_t)(w) & 0xFFFUL) << 12) | ((uint32_t)(h) & 0xFFFUL))

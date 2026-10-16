@@ -12,6 +12,7 @@
 #include "eve.h"
 #include "eve_panels.h"
 #include "fixmath.h"
+#include "logo.h"
 #include "mock_eve.h"
 
 static int s_failures;
@@ -342,6 +343,8 @@ typedef struct {
     size_t dl_words; /* display list words the co-processor will emit, approx. */
     int begin_depth;
     int max_begin_depth;
+    int context_depth;     /* SAVE_CONTEXT minus RESTORE_CONTEXT */
+    bool context_underflow;
     int vertices;
     int vertex_out_of_range;
     bool starts_with_dlstart;
@@ -453,6 +456,11 @@ static stream_stats_t parse_stream(const char *needle)
             }
         } else if ((w >> 24) == 0x21u) { /* END */
             s.begin_depth--;
+        } else if (w == SAVE_CONTEXT()) {
+            s.context_depth++;
+        } else if (w == RESTORE_CONTEXT()) {
+            s.context_underflow = s.context_underflow || s.context_depth == 0;
+            s.context_depth--;
         }
         i++;
     }
@@ -470,6 +478,8 @@ static void check_frame(const char *name)
     CHECK_EQ(s.begin_depth, 0);
     CHECK_EQ(s.max_begin_depth, 1);
     CHECK_EQ(s.vertex_out_of_range, 0);
+    CHECK_EQ(s.context_depth, 0);
+    CHECK(!s.context_underflow);
     CHECK(s.dl_words < RAM_DL_SIZE / 4); /* fits in the 8 KB display list */
 }
 
@@ -581,6 +591,136 @@ static void test_dashboard_alerts(void)
     CHECK_EQ(parse_stream(NULL).texts, normal_texts + 1); /* just the word, no alert */
 }
 
+/* ---------------------------------------------------------------------------
+ * Logo
+ * ------------------------------------------------------------------------ */
+
+static int64_t cross(const logo_point_t *o, const logo_point_t *a, const logo_point_t *b)
+{
+    return (int64_t)(a->x - o->x) * (b->y - o->y) - (int64_t)(a->y - o->y) * (b->x - o->x);
+}
+
+/* Segments ab and cd cross or touch. */
+static bool segments_meet(const logo_point_t *a, const logo_point_t *b, const logo_point_t *c,
+                          const logo_point_t *d)
+{
+    const int64_t d1 = cross(c, d, a);
+    const int64_t d2 = cross(c, d, b);
+    const int64_t d3 = cross(a, b, c);
+    const int64_t d4 = cross(a, b, d);
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+        return true;
+    }
+    /* Collinear and overlapping */
+#define ON(p, q, r) (cross(p, q, r) == 0 && (r)->x >= (p->x < q->x ? p->x : q->x) && \
+                     (r)->x <= (p->x > q->x ? p->x : q->x) && (r)->y >= (p->y < q->y ? p->y : q->y) && \
+                     (r)->y <= (p->y > q->y ? p->y : q->y))
+    const bool touch = ON(c, d, a) || ON(c, d, b) || ON(a, b, c) || ON(a, b, d);
+#undef ON
+    return touch;
+}
+
+static void test_logo_outline(void)
+{
+    const uint32_t n = logo_outline_len;
+    CHECK(n >= 3);
+
+    /* The table spans exactly LOGO_WIDTH x LOGO_HEIGHT. */
+    uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX, max_x = 0, max_y = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const logo_point_t *p = &logo_outline[i];
+        min_x = p->x < min_x ? p->x : min_x;
+        min_y = p->y < min_y ? p->y : min_y;
+        max_x = p->x > max_x ? p->x : max_x;
+        max_y = p->y > max_y ? p->y : max_y;
+        const logo_point_t *q = &logo_outline[(i + 1) % n];
+        CHECK(p->x != q->x || p->y != q->y); /* no zero-length edges */
+    }
+    CHECK_EQ(min_x, 0);
+    CHECK_EQ(min_y, 0);
+    CHECK_EQ(max_x, LOGO_WIDTH);
+    CHECK_EQ(max_y, LOGO_HEIGHT);
+
+    /* A simple polygon: no edge meets another except its neighbours at the
+     * shared corner. Crossing edges would punch holes in the even-odd fill. */
+    int meets = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t j = i + 2; j < n; j++) {
+            if (i == 0 && j == n - 1) {
+                continue; /* neighbours through the wrap-around */
+            }
+            if (segments_meet(&logo_outline[i], &logo_outline[(i + 1) % n], &logo_outline[j],
+                              &logo_outline[(j + 1) % n])) {
+                printf("  edges %u and %u meet\n", (unsigned)i, (unsigned)j);
+                meets++;
+            }
+        }
+    }
+    CHECK_EQ(meets, 0);
+
+    CHECK_EQ(logo_height(LOGO_WIDTH), LOGO_HEIGHT);
+    CHECK_EQ(logo_height(320), 164);
+}
+
+static void test_logo_draw(void)
+{
+    const int32_t x = 240, y = 84, w = 320;
+    const int32_t h = logo_height(w);
+    init_ok();
+    logo_draw(x, y, w, 0xFFFFFFu);
+    CHECK_EQ(eve_cmd_flush(), EVE_OK);
+
+    /* Display list only, wrapped in a saved context. */
+    const size_t n = mock_fifo_words();
+    CHECK(n > 2 * logo_outline_len);
+    CHECK_EQ(mock_fifo_word(0), SAVE_CONTEXT());
+    CHECK_EQ(mock_fifo_word(n - 1), RESTORE_CONTEXT());
+
+    uint32_t prim = 0;
+    int strip_vertices = 0, outline_vertices = 0, stray = 0;
+    uint32_t first = 0, last = 0;
+    bool saw_invert = false, saw_fill = false, saw_clear_on_fill = false;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t word = mock_fifo_word(i);
+        CHECK((word & 0xFFFFFF00u) != 0xFFFFFF00u); /* no co-processor commands */
+        if ((word >> 24) == 0x1Fu) {
+            prim = word & 0xFu;
+            first = 0;
+        } else if (word == STENCIL_OP(KEEP, INVERT)) {
+            saw_invert = true;
+        } else if (word == STENCIL_FUNC(EQUAL, 255, 255)) {
+            saw_fill = true;
+        } else if (word == STENCIL_OP(KEEP, ZERO)) {
+            saw_clear_on_fill = saw_fill;
+        } else if ((word >> 30) == 1u && (prim == EDGE_STRIP_B || prim == LINE_STRIP)) {
+            const int32_t vx = (int32_t)((word >> 15) & 0x7FFFu);
+            const int32_t vy = (int32_t)(word & 0x7FFFu);
+            if (vx < x * 16 || vx > (x + w) * 16 || vy < y * 16 || vy > (y + h) * 16) {
+                stray++;
+            }
+            if (first == 0) {
+                first = word;
+            }
+            last = word;
+            if (prim == EDGE_STRIP_B) {
+                strip_vertices++;
+            } else {
+                outline_vertices++;
+            }
+            if (strip_vertices == (int)logo_outline_len + 1 && prim == EDGE_STRIP_B) {
+                CHECK_EQ(first, last); /* closed */
+            }
+        }
+    }
+    CHECK(saw_invert);
+    CHECK(saw_fill);
+    CHECK(saw_clear_on_fill); /* the stencil is left clear for whatever comes next */
+    CHECK_EQ(strip_vertices, logo_outline_len + 1);
+    CHECK_EQ(outline_vertices, logo_outline_len + 1);
+    CHECK_EQ(first, last); /* the outline is closed too */
+    CHECK_EQ(stray, 0);
+}
+
 static void test_rev_sweep(void)
 {
     init_ok();
@@ -655,6 +795,8 @@ int main(void)
     RUN(test_render_splash);
     RUN(test_render_dashboard);
     RUN(test_dashboard_alerts);
+    RUN(test_logo_outline);
+    RUN(test_logo_draw);
     RUN(test_rev_sweep);
     RUN(test_fixmath);
     RUN(test_demo_data);

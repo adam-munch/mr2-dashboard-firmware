@@ -16,6 +16,7 @@ add_executable(host_tests
     ${SRC}/app/dashboard.c
     ${SRC}/app/demo_data.c
     ${SRC}/app/fixmath.c
+    ${SRC}/app/logo.c
 )
 
 target_include_directories(host_tests PRIVATE . ${SRC}/eve ${SRC}/app)
@@ -37,5 +38,6 @@ add_executable(preview_dump
     ${SRC}/eve/eve_panels.c
     ${SRC}/app/dashboard.c
     ${SRC}/app/fixmath.c
+    ${SRC}/app/logo.c
 )
 target_include_directories(preview_dump PRIVATE . ${SRC} ${SRC}/eve ${SRC}/app)
