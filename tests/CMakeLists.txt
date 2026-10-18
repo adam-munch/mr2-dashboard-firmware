@@ -18,7 +18,10 @@ add_executable(host_tests
     ${SRC}/app/demo_data.c
     ${SRC}/app/ecu_link.c
     ${SRC}/app/fixmath.c
+    ${SRC}/app/guide.c
+    ${SRC}/app/logo.c
     ${SRC}/app/rusefi_can.c
+    ${SRC}/app/ui.c
 )
 
 target_include_directories(host_tests PRIVATE . ${SRC}/eve ${SRC}/can ${SRC}/app)
@@ -40,5 +43,8 @@ add_executable(preview_dump
     ${SRC}/eve/eve_panels.c
     ${SRC}/app/dashboard.c
     ${SRC}/app/fixmath.c
+    ${SRC}/app/guide.c
+    ${SRC}/app/logo.c
+    ${SRC}/app/ui.c
 )
 target_include_directories(preview_dump PRIVATE . ${SRC} ${SRC}/eve ${SRC}/app)

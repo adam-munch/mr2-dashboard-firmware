@@ -7,20 +7,29 @@ display and shows engine data from a [rusEFI](https://rusefi.com/) ECU
 sends compact display-list commands over SPI. The FT812 does the rendering;
 there's no frame buffer on the MCU.
 
-![Dashboard preview](docs/dashboard-preview.png)
+![Dashboard preview: cruising](docs/dashboard-preview.png)
 
-*Approximate preview, rendered on a PC from the firmware's real command stream
-by `tools/render_preview.py`. The fonts are stand-ins for the EVE ROM fonts.*
+![Dashboard preview: at the shift point with three alerts](docs/dashboard-preview-alerts.png)
+
+![Splash preview: team logo and start lights](docs/splash-preview.png)
+
+*Approximate previews, rendered on a PC from the firmware's real command stream
+by `tools/render_preview.py`. The fonts are stand-ins for the EVE ROM fonts.
+Top: cruising, everything normal. Middle: at the shift point, with both ECU
+warning lamps on and an overheating engine, low fuel and low battery. Bottom: the boot splash with the
+team logo, three start lights in.*
 
 ## What it does
 
 1. Brings up the clock (64 MHz from a crystal or HSI16), SysTick, SPI1, the
    debug UART and the CAN controller (FDCAN1, 500 kbit/s).
 2. Resets and initialises the FT812 using the timing from the NHD datasheet.
-3. Shows a splash screen, fades the backlight in and sweeps the tach needle.
-4. Runs the gauge screen at about 60 fps: a tachometer with redline, a shift
-   light, check-engine and limiter lamps, speed, gear, and
-   coolant/fuel/battery bars, all from the ECU's CAN broadcast.
+3. Shows a splash screen with the team logo, fades the backlight in, runs five
+   F1-style start lights, and on "lights out" sweeps the rev bar to the stop
+   and back.
+4. Walks the driver through starting the engine, one screen per step (see
+   [Pre-start guide](#pre-start-guide)), then runs the main screen at about
+   60 fps (see [Screen](#screen)), all from the ECU's CAN broadcast.
 5. Sends a status frame back to the ECU 10 times a second (see
    [Dashboard → ECU](#dashboard--ecu)).
 
@@ -28,6 +37,98 @@ If the display stops responding (cable unplugged, co-processor fault), the
 firmware logs it and re-initialises once a second. The CAN link keeps running
 meanwhile. For bench work without an ECU, build with `-DMR2_DEMO_DATA=ON` to
 show a built-in simulation instead (the screen then says "DEMO DATA").
+
+## Screen
+
+The layout borrows from F1 steering-wheel displays. Colour always means
+something: while everything is normal the screen is monochrome apart from the
+shift lights, and a value only turns blue, amber or red when it needs
+attention.
+
+| Element | What it shows |
+|---|---|
+| Shift lights | 15 LEDs across the top in green, red and purple groups. The first lights at 4500 rpm, one more about every 140 rpm, and at 6500 rpm all of them flash purple |
+| Rev bar | 0–8000 rpm in 250 rpm segments, with the redline zone (7000+) tinted red |
+| Gear | Centre box. Its frame takes the colour of the shift lights, and the whole box flashes purple at the shift point, so the cue is also in central vision. Neutral shows a green N |
+| Speed, rpm | Either side of the gear. rpm turns red past the redline |
+| Lamps | CHECK ENGINE (amber) under the speed and LIMITER (red) under the rpm, from the ECU, only while on |
+| Alert | Appears under the gear only when something is wrong: the most severe message, plus a count of any others (`COOLANT HOT  +2`). Critical ones flash |
+| Coolant, fuel, battery | Tiles along the bottom. Each bar has its danger zone tinted, and the tile shows a status word and accent colour only when the value is out of range |
+
+Thresholds (all in `src/app/dashboard.c`):
+
+| Value | Status | Alert |
+|---|---|---|
+| Coolant < 60 °C | `COLD`, blue | none: it's information, not a fault |
+| Coolant > 100 °C | `HIGH`, amber | `COOLANT HIGH` |
+| Coolant > 105 °C | `HOT`, red | `COOLANT HOT` (critical) |
+| Fuel < 15 % | `LOW`, amber | `LOW FUEL` |
+| Fuel < 5 % | `EMPTY`, red | `FUEL EMPTY` (critical) |
+| Battery < 11.8 V | `LOW`, amber | `BATTERY LOW` |
+| Battery > 15.0 V | `HIGH`, amber | `VOLTAGE HIGH` |
+| Battery < 13.0 V with the engine running | `NO CHG`, amber | `NOT CHARGING` |
+
+### Pre-start guide
+
+![Pre-start guide: e-stop, steering wheel, and the start step blocked and ready](docs/guide-preview.png)
+
+Starting the engine takes three things, in order: turn off the e-stop, plug
+in the steering wheel, press start. Until the engine runs, the screen shows
+the first one not done yet. A stepper along the top shows progress (done steps
+turn green), and each screen has an icon, the instruction, and the live state
+of the input it is waiting for. The screens follow the inputs, so a step that
+is undone again (e-stop pressed back in) brings its screen back.
+
+The start button only works in neutral or with the clutch held, so the start
+screen puts that rule in an amber-framed card with both conditions live:
+each turns green with a tick when met (the neutral one also shows the gear
+selected), and either one is enough. Below it the screen says `NOT READY`,
+`READY TO START` (the button's ring turns green and pulses) or `CRANKING`.
+
+The guide is for a parked car. It shows while rpm and speed say the engine
+is off (below 400 rpm) and the car is stopped, and right after power-up
+while the ECU hasn't said anything yet. If the engine stops or the ECU goes
+quiet while the car is still rolling, the gauges stay up, so speed stays
+visible.
+
+The inputs are `estop_active`, `wheel_connected` and `clutch_held` in
+`dash_data_t`, along with `gear` and `rpm` from the ECU. The ECU doesn't
+broadcast the first three, so they count only once their `DASH_VALID_ESTOP`,
+`DASH_VALID_WHEEL` and `DASH_VALID_CLUTCH` bits are set (see
+[Notes](#notes-and-next-steps)). Until then the guide doesn't pretend: steps
+it can't check are dimmed with a dash and skipped, the clutch shows `--`, and
+with neither condition known to be met it gives no verdict.
+
+**The neutral check is only as good as the ECU's gear.** Without gear
+detection set up in rusEFI, the ECU reports neutral in every gear, and the
+start screen will say `READY TO START` while in gear.
+
+The demo (`-DMR2_DEMO_DATA=ON`) runs through the whole procedure after boot:
+e-stop released at 3 s, wheel in at 6 s, first gear still selected so start
+is blocked until the clutch goes down at 8.5 s, then cranking at 10 s and the
+engine catching at 10.8 s.
+
+### Team logo
+
+The splash logo is stored as its outline, not as a bitmap: 34 corner points,
+136 bytes of flash, and nothing loaded into the FT812's graphics RAM. The
+FT812 fills it with a stencil-buffer polygon fill (`EDGE_STRIP_B` with
+`INVERT`) inside the logo's box, then draws a 1 px line along the outline to
+anti-alias the edges, so it stays sharp at any size. A 320 px wide bitmap
+would take about 6 KB at 1 bit per pixel with jagged edges, or about 26 KB
+anti-aliased at 4 bits per pixel.
+
+To change the logo, trace the new artwork and paste the output into
+`src/app/logo.c` and `logo.h` (needs Pillow and NumPy):
+
+```sh
+tools/trace_logo.py new-logo.png
+```
+
+The artwork has to be one light shape with straight edges and no holes; the
+script says so if it isn't. It also reports how closely the outline matches the
+artwork. The host tests check that the outline is a simple polygon that fills
+the declared size.
 
 ## Hardware
 
@@ -158,7 +259,8 @@ In TunerStudio's CAN settings (uaEFI defaults shown):
 | rusEFI CAN data period | 50 ms | (`ECU_DATA_TIMEOUT_MS` must be well above this) |
 
 For the gear indicator, set up gear detection on the ECU (gear count and
-ratios, with a VSS). Without it rusEFI sends 0 and the dash shows N.
+ratios, with a VSS). Without it rusEFI sends 0 and the dash shows N, which
+also makes the pre-start guide's neutral check read as met.
 
 ### What's shown
 
@@ -169,11 +271,11 @@ ECU --CAN--> FDCAN1 --interrupt--> receive queue (64 frames, timestamped)
 
 | Screen | rusEFI message | Signal |
 |---|---|---|
-| Tach, rpm, shift light | base+1 | RPM |
+| Shift lights, rev bar, rpm | base+1 | RPM |
 | Speed | base+1 | VehicleSpeed |
 | Gear | base+0 | CurrentGear |
-| CHECK ENGINE lamp | base+0 | CELAct |
-| LIMITER lamp | base+0 | RevLimAct: fuel or spark cut for any reason (rev limiter, launch control, limp mode…) |
+| CHECK ENGINE lamp (only shown while on) | base+0 | CELAct |
+| LIMITER lamp (only shown while on) | base+0 | RevLimAct: fuel or spark cut for any reason (rev limiter, launch control, limp mode…) |
 | Coolant | base+3 | CoolantTemp |
 | Fuel | base+3 | FuelLevel |
 | Battery | base+4 | BattVolt |
@@ -183,12 +285,13 @@ TPS/pedal, oil pressure and temperature, lambda, fuel pressure, trims, EGTs,
 cams, knock and so on. They're available through `ecu_link_data()` for future
 screens.
 
-The ECU updates rpm 20 times a second and the screen redraws 60 times, so the
-needle is low-pass filtered (`ECU_RPM_SMOOTH_MS`, 40 ms) to move smoothly.
+The ECU updates rpm 20 times a second and the screen redraws 60 times, so rpm
+is low-pass filtered (`ECU_RPM_SMOOTH_MS`, 40 ms) to move smoothly.
 
 **Stale data is never shown as live.** Each value expires 1 s
 (`ECU_DATA_TIMEOUT_MS`) after its message last arrived. It's then drawn as
-`--`, the needle drops to 0, and the bottom-right corner says why:
+`--`, the shift lights and rev bar drop to 0, and the bottom-right corner says
+why:
 
 | Status line | Meaning |
 |---|---|
@@ -248,6 +351,11 @@ The tests check:
 - the register values from the datasheet
 - command-FIFO chunking and fault recovery
 - every rendered frame: well-formed, on-screen, and small enough for the 8 KB display list
+- which alerts, lamps and status words the dashboard shows, and their priority and flashing
+- the logo outline (a simple polygon of the declared size) and its stencil fill
+- the pre-start guide: which step shows, the neutral-or-clutch rule and its
+  live state, what it does with inputs it can't see, and that the demo's start
+  procedure runs in order and only cranks when the rule allows it
 - the rusEFI decoder, against frames built from the signal definitions in
   rusEFI's DBC file (not from the decoder's own byte offsets)
 - the pipeline: value mapping, expiry, link states, frames queued past their
@@ -290,27 +398,36 @@ src/
     can_queue.h         interrupt -> main loop frame queue
     can_stm32.c         FDCAN driver: filters, receive interrupt, TX FIFO, bus-off recovery
   app/
-    dashboard.c         screen layout and drawing
+    dashboard.c         main screen and splash, and which screen to show
+    guide.c             pre-start guide screens
+    ui.c/.h             shared palette, fonts and drawing helpers
     dash_data.h         what the screen shows, with validity and link state
     ecu_link.c/.h       CAN pipeline: ECU data -> dash values, dash status -> ECU; its settings
     rusefi_can.c/.h     rusEFI broadcast decoder (all 12 messages)
-    demo_data.c         simulated engine data
+    demo_data.c         simulated engine data, including the start procedure
     fixmath.c           integer sin/cos for the gauge geometry
+    logo.c              team logo outline and its polygon fill
 linker/                 STM32G0B1CBTx linker script
 third_party/            CMSIS core 5.9.0 and ST cmsis_device_g0 v1.4.5 (Apache-2.0)
 tests/                  host tests, mock FT812, mock CAN driver, preview dumper
 tools/render_preview.py approximate PNG renderer for command streams
+tools/trace_logo.py     turns logo artwork into the outline table in logo.c
 tools/rusefi/           ECU-side Lua script for the dash status frame
 ```
 
 ## Notes and next steps
 
+- **Start inputs.** The e-stop, steering-wheel detect and clutch switch are
+  plain on/off signals that the ECU doesn't broadcast. Read them on spare
+  GPIOs (or from another CAN node), fill in `estop_active`, `wheel_connected`
+  and `clutch_held`, and set their `DASH_VALID_*` bits; the pre-start guide
+  then checks them.
 - **More from the ECU.** Everything rusEFI broadcasts is decoded already
   (`ecu_link_data()`). Oil pressure, AFR and boost are a matter of screen
   space.
 - **Dash inputs.** The status frame carries 16 inputs and a mode byte to the
   ECU, but no buttons are wired yet.
-- **Throughput.** The SPI driver is polled. A frame is about 1.5 KB, roughly
+- **Throughput.** The SPI driver is polled. A frame is under 2 KB, roughly
   1 ms at 16 MHz, so DMA is a later optimisation and not needed yet.
 - **Not used yet.** Touch (this module has no panel fitted, so the touch
   engine is switched off), audio (AUDIO_L needs the datasheet's filter and

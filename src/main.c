@@ -3,7 +3,9 @@
  * NHD-7.0-800480FT-CSXP (FT812 EVE) 7" display, fed by a rusEFI ECU
  * (uaEFI) over CAN.
  *
- * Boot: splash -> backlight fade-in -> tach needle sweep -> live screen.
+ * Boot: splash -> backlight fade-in -> start lights -> rev sweep -> live screen,
+ * which guides the driver through starting the engine (e-stop, steering
+ * wheel, start button) and then shows the gauges.
  * Values come from the ECU's CAN broadcast (ecu_link.c), or from a
  * built-in simulation when built with DASH_DEMO_DATA=1. If the display
  * stops responding, it is re-initialised once a second; the CAN link keeps
@@ -29,8 +31,8 @@
 #define FRAME_PERIOD_MS    16u  /* ~60 fps, matching the panel's 61.6 Hz */
 #define BACKLIGHT_DUTY     128u /* 0..128. Full brightness draws ~760 mA from VBL at 3.3 V */
 #define BACKLIGHT_FADE_MS  400u
-#define SPLASH_HOLD_MS     800u
-#define NEEDLE_SWEEP_MS    1500u
+#define START_LIGHT_MS     200u /* between start lights, and before lights out */
+#define REV_SWEEP_MS       1500u
 #define HEARTBEAT_MS       500u
 
 /* Wait, keeping the CAN link serviced. */
@@ -103,17 +105,35 @@ static eve_status_t run_dashboard(void)
         ecu_link_get_dash(&data, millis());
     }
 
-    eve_status_t st = dashboard_draw_splash(FW_VERSION, eve_chip_id());
+    eve_status_t st = dashboard_draw_splash(FW_VERSION, eve_chip_id(), 0u);
     if (st != EVE_OK) {
         return st;
     }
     ecu_link_set_display_ok(true);
     backlight_fade_in(BACKLIGHT_DUTY, BACKLIGHT_FADE_MS);
-    wait_ms(SPLASH_HOLD_MS);
 
-    st = dashboard_needle_sweep(&data, NEEDLE_SWEEP_MS);
+    for (uint32_t lights = 1u; lights <= DASHBOARD_START_LIGHTS; lights++) {
+        wait_ms(START_LIGHT_MS);
+        st = eve_cmd_wait_idle(100u);
+        if (st == EVE_OK) {
+            st = dashboard_draw_splash(FW_VERSION, eve_chip_id(), lights);
+        }
+        if (st != EVE_OK) {
+            return st;
+        }
+    }
+    wait_ms(START_LIGHT_MS);
+
+    /* Lights out. */
+    st = dashboard_rev_sweep(&data, REV_SWEEP_MS);
     if (st != EVE_OK) {
         return st;
+    }
+
+    /* Start the simulation (and its start procedure) as the live screen,
+     * beginning with the pre-start guide, comes up. */
+    if (DASH_DEMO_DATA) {
+        demo_data_init(&data, millis());
     }
 
     uint32_t last_frame = millis();

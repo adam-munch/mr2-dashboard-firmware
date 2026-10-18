@@ -15,6 +15,8 @@
 #include "eve.h"
 #include "eve_panels.h"
 #include "fixmath.h"
+#include "guide.h"
+#include "logo.h"
 #include "mock_can.h"
 #include "mock_eve.h"
 #include "rusefi_can.h"
@@ -348,12 +350,15 @@ typedef struct {
     size_t dl_words; /* display list words the co-processor will emit, approx. */
     int begin_depth;
     int max_begin_depth;
+    int context_depth;     /* SAVE_CONTEXT minus RESTORE_CONTEXT */
+    bool context_underflow;
     int vertices;
     int vertex_out_of_range;
     bool starts_with_dlstart;
     bool ends_with_display_swap;
     bool parse_error;
     int texts;
+    int needle_hits; /* CMD_TEXT strings equal to the needle */
 } stream_stats_t;
 
 /* Number of words a string argument occupies (NUL included, padded). */
@@ -369,7 +374,25 @@ static size_t str_words(size_t at)
     }
 }
 
-static stream_stats_t parse_stream(void)
+/* Display list words the co-processor emits for `chars` glyphs: one CELL and
+ * one VERTEX2F each past x = 511 (VERTEX2II can't reach), plus setup. */
+static size_t glyph_dl_words(size_t chars)
+{
+    return 8 + 2 * chars;
+}
+
+static size_t number_chars(int32_t n)
+{
+    size_t chars = n < 0 ? 2 : 1;
+    for (int64_t v = n < 0 ? -(int64_t)n : n; v >= 10; v /= 10) {
+        chars++;
+    }
+    return chars;
+}
+
+/* Walk the captured co-processor stream. If `needle` is set, count the
+ * CMD_TEXT strings that match it exactly. */
+static stream_stats_t parse_stream(const char *needle)
 {
     stream_stats_t s = {0};
     const size_t n = mock_fifo_words();
@@ -385,14 +408,19 @@ static stream_stats_t parse_stream(void)
             case CMD_SWAP:
                 i += 1;
                 break;
-            case CMD_TEXT:
+            case CMD_TEXT: {
+                const char *str = (const char *)&g_mock.fifo[(i + 3) * 4];
                 s.texts++;
-                s.dl_words += 8 + str_words(i + 3);
+                s.dl_words += glyph_dl_words(strlen(str));
+                if (needle != NULL && strcmp(str, needle) == 0) {
+                    s.needle_hits++;
+                }
                 i += 3 + str_words(i + 3);
                 break;
+            }
             case CMD_NUMBER:
                 s.texts++;
-                s.dl_words += 12;
+                s.dl_words += glyph_dl_words(number_chars((int32_t)mock_fifo_word(i + 3)));
                 i += 4;
                 break;
             case CMD_GRADIENT:
@@ -435,6 +463,11 @@ static stream_stats_t parse_stream(void)
             }
         } else if ((w >> 24) == 0x21u) { /* END */
             s.begin_depth--;
+        } else if (w == SAVE_CONTEXT()) {
+            s.context_depth++;
+        } else if (w == RESTORE_CONTEXT()) {
+            s.context_underflow = s.context_underflow || s.context_depth == 0;
+            s.context_depth--;
         }
         i++;
     }
@@ -443,7 +476,7 @@ static stream_stats_t parse_stream(void)
 
 static void check_frame(const char *name)
 {
-    const stream_stats_t s = parse_stream();
+    const stream_stats_t s = parse_stream(NULL);
     printf("  %s: %zu FIFO words (%zu bytes), ~%zu DL words, %d vertices, %d text items\n", name, s.words,
            s.words * 4, s.dl_words, s.vertices, s.texts);
     CHECK(!s.parse_error);
@@ -452,14 +485,36 @@ static void check_frame(const char *name)
     CHECK_EQ(s.begin_depth, 0);
     CHECK_EQ(s.max_begin_depth, 1);
     CHECK_EQ(s.vertex_out_of_range, 0);
+    CHECK_EQ(s.context_depth, 0);
+    CHECK(!s.context_underflow);
     CHECK(s.dl_words < RAM_DL_SIZE / 4); /* fits in the 8 KB display list */
+}
+
+/* How many times `text` is drawn in the captured frame. */
+static int frame_text_count(const char *text)
+{
+    return parse_stream(text).needle_hits;
+}
+
+/* Number of vertices in the captured frame. */
+static int frame_vertices(void)
+{
+    return parse_stream(NULL).vertices;
 }
 
 static void test_render_splash(void)
 {
-    init_ok();
-    CHECK_EQ(dashboard_draw_splash("0.1.0", 0x00011208u), EVE_OK);
-    check_frame("splash");
+    int vertices[3];
+    static const uint32_t lights[3] = {0, DASHBOARD_START_LIGHTS, 99};
+    for (size_t i = 0; i < 3; i++) {
+        init_ok();
+        CHECK_EQ(dashboard_draw_splash("0.1.0", 0x00011208u, lights[i]), EVE_OK);
+        check_frame("splash");
+        vertices[i] = frame_vertices();
+    }
+    /* Each lit start light adds its glow; out-of-range counts clamp. */
+    CHECK_EQ(vertices[1] - vertices[0], DASHBOARD_START_LIGHTS);
+    CHECK_EQ(vertices[2], vertices[1]);
 }
 
 /* True if the captured stream draws the string `s` with CMD_TEXT. */
@@ -490,12 +545,16 @@ static void test_render_dashboard(void)
         {.rpm = 5000, .valid = DASH_VALID_RPM, .link = DASH_LINK_LOST},
         {.valid = 0, .link = DASH_LINK_CAN_FAULT},
     };
+    /* Both phases of the shift-light and alert flashing. */
+    static const uint32_t times[] = {0, 100, 250};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        init_ok();
-        CHECK_EQ(dashboard_draw(&cases[i], 1234), EVE_OK);
-        char name[32];
-        snprintf(name, sizeof name, "dashboard #%zu", i);
-        check_frame(name);
+        for (size_t t = 0; t < sizeof times / sizeof times[0]; t++) {
+            init_ok();
+            CHECK_EQ(dashboard_draw(&cases[i], times[t]), EVE_OK);
+            char name[48];
+            snprintf(name, sizeof name, "dashboard #%zu at %u ms", i, (unsigned)times[t]);
+            check_frame(name);
+        }
     }
 }
 
@@ -508,21 +567,31 @@ static void test_render_validity_and_status(void)
     CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
     CHECK(!stream_has_text("--"));
     CHECK(stream_has_text("N"));
-    CHECK(stream_has_text("CHECK ENGINE"));
-    CHECK(stream_has_text("LIMITER"));
+    CHECK(!stream_has_text("CHECK ENGINE")); /* lamps only appear while on */
+    CHECK(!stream_has_text("LIMITER"));
     CHECK(!stream_has_text("DEMO DATA"));
     CHECK(!stream_has_text("WAITING FOR ECU"));
     CHECK(!stream_has_text("NO DATA FROM ECU"));
 
-    /* Nothing valid: every value is "--", gear is "-". */
-    d.valid = 0;
-    d.link = DASH_LINK_WAITING;
+    /* Each lamp shows while its warning is on. */
+    d.warnings = DASH_WARN_CHECK_ENGINE | DASH_WARN_LIMITER;
     init_ok();
     CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK(stream_has_text("CHECK ENGINE"));
+    CHECK(stream_has_text("LIMITER"));
+    d.warnings = 0;
+
+    /* Nothing valid (the ECU went quiet, maybe on the move): the gauges stay,
+     * every value is "--" and the gear "-". */
+    d.valid = 0;
+    d.link = DASH_LINK_LOST;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK(stream_has_text("KM/H"));
     CHECK(stream_has_text("--"));
     CHECK(stream_has_text("-"));
     CHECK(!stream_has_text("N"));
-    CHECK(stream_has_text("WAITING FOR ECU"));
+    CHECK(stream_has_text("NO DATA FROM ECU"));
 
     static const struct {
         dash_link_t link;
@@ -541,12 +610,363 @@ static void test_render_validity_and_status(void)
     }
 }
 
-static void test_needle_sweep(void)
+static void test_dashboard_alerts(void)
+{
+    const dash_data_t normal = {.rpm = 3000, .speed_kph = 90, .coolant_c = 88, .fuel_pct = 60,
+                                .battery_mv = 14100, .gear = 4, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK};
+
+    /* All normal: no alert, no status words. */
+    init_ok();
+    CHECK_EQ(dashboard_draw(&normal, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("LOW FUEL"), 0);
+    CHECK_EQ(frame_text_count("COOLANT HOT"), 0);
+    CHECK_EQ(frame_text_count("NOT CHARGING"), 0);
+    CHECK_EQ(frame_text_count("COLD"), 0);
+    CHECK_EQ(frame_text_count("DEMO DATA"), 0);
+
+    /* One warning. */
+    dash_data_t d = normal;
+    d.fuel_pct = 14;
+    d.link = DASH_LINK_DEMO;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("LOW FUEL"), 1);
+    CHECK_EQ(frame_text_count("LOW"), 1); /* on the tile */
+    CHECK_EQ(frame_text_count("DEMO DATA"), 1);
+
+    /* Critical outranks warnings, and the rest are counted. */
+    d.link = DASH_LINK_OK;
+    d.coolant_c = 110;
+    d.battery_mv = 12400; /* engine running, so: not charging */
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("COOLANT HOT  +2"), 1);
+    CHECK_EQ(frame_text_count("HOT"), 1);
+    CHECK_EQ(frame_text_count("NO CHG"), 1);
+
+    /* Critical alerts flash at 2 Hz; the tiles keep their status. */
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 250), EVE_OK);
+    CHECK_EQ(frame_text_count("COOLANT HOT  +2"), 0);
+    CHECK_EQ(frame_text_count("HOT"), 1);
+
+    /* Low voltage with the engine off is only a flat battery... */
+    d = normal;
+    d.rpm = 0;
+    d.battery_mv = 12400;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("NOT CHARGING"), 0);
+
+    /* An rpm the ECU isn't sending doesn't count as running, however high. */
+    d = normal;
+    d.battery_mv = 12400;
+    d.valid &= (uint16_t)~DASH_VALID_RPM;
+    CHECK(!dash_engine_running(&d));
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("NOT CHARGING"), 0);
+
+    /* ...and a cold engine is information, not an alert. */
+    d = normal;
+    d.coolant_c = 30;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_text_count("COLD"), 1);
+    init_ok();
+    CHECK_EQ(dashboard_draw(&normal, 0), EVE_OK);
+    const int normal_texts = parse_stream(NULL).texts;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(parse_stream(NULL).texts, normal_texts + 1); /* just the word, no alert */
+}
+
+/* ---------------------------------------------------------------------------
+ * Pre-start guide
+ * ------------------------------------------------------------------------ */
+
+/* Draw `d` as one frame and run the usual frame checks on it. */
+static void draw_checked(const dash_data_t *d, const char *name)
 {
     init_ok();
+    CHECK_EQ(dashboard_draw(d, 0), EVE_OK);
+    check_frame(name);
+}
+
+static void test_guide_screens(void)
+{
+    static const char *const rule = "Only starts in neutral or with the clutch held";
+    dash_data_t d = {.coolant_c = 20, .fuel_pct = 50, .battery_mv = 12500, .gear = 2,
+                     .valid = DASH_VALID_ALL | DASH_VALID_INPUTS, .link = DASH_LINK_OK, .estop_active = true};
+
+    /* Step 1 comes first, whatever else is already done. */
+    CHECK_EQ(guide_step(&d), GUIDE_ESTOP);
+    d.wheel_connected = true;
+    CHECK_EQ(guide_step(&d), GUIDE_ESTOP);
+    draw_checked(&d, "guide: e-stop");
+    CHECK_EQ(frame_text_count("TURN OFF THE E-STOP"), 1);
+    CHECK_EQ(frame_text_count("E-STOP ACTIVE"), 1);
+    CHECK_EQ(frame_text_count("KM/H"), 0); /* not the gauges */
+
+    /* Step 2 */
+    d.estop_active = false;
+    d.wheel_connected = false;
+    CHECK_EQ(guide_step(&d), GUIDE_WHEEL);
+    draw_checked(&d, "guide: wheel");
+    CHECK_EQ(frame_text_count("PLUG IN THE STEERING WHEEL"), 1);
+    CHECK_EQ(frame_text_count("WHEEL NOT DETECTED"), 1);
+
+    /* Step 3 in gear with the clutch up: the rule is spelled out, start won't work. */
+    d.wheel_connected = true;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_BLOCKED);
+    draw_checked(&d, "guide: start, not ready");
+    CHECK_EQ(frame_text_count("PRESS START"), 1);
+    CHECK_EQ(frame_text_count(rule), 1);
+    CHECK_EQ(frame_text_count("NOT READY"), 1);
+    CHECK_EQ(frame_text_count("READY TO START"), 0);
+    CHECK_EQ(frame_text_count("2"), 1); /* the gear it's in */
+
+    /* Either condition is enough. */
+    d.clutch_held = true;
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_READY);
+    draw_checked(&d, "guide: start, clutch held");
+    CHECK_EQ(frame_text_count(rule), 1); /* still shown */
+    CHECK_EQ(frame_text_count("READY TO START"), 1);
+    CHECK_EQ(frame_text_count("NOT READY"), 0);
+
+    d.clutch_held = false;
+    d.gear = 0;
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_READY);
+    draw_checked(&d, "guide: start, neutral");
+    CHECK_EQ(frame_text_count("READY TO START"), 1);
+    CHECK_EQ(frame_text_count("N"), 1);
+
+    /* Cranking: still the start screen, saying so. */
+    d.rpm = 220;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+    draw_checked(&d, "guide: cranking");
+    CHECK_EQ(frame_text_count("CRANKING"), 1);
+    CHECK_EQ(frame_text_count("READY TO START"), 0);
+
+    /* Running: the gauges. */
+    d.rpm = DASH_RPM_RUNNING;
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    draw_checked(&d, "running");
+    CHECK_EQ(frame_text_count("KM/H"), 1);
+    CHECK_EQ(frame_text_count("PRESS START"), 0);
+
+    /* Stalled on the move: the gauges stay until the car stops. */
+    d.rpm = 0;
+    d.speed_kph = 40;
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    d.speed_kph = 0;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+
+    /* The rev sweep shows the gauges even where it passes 0 rpm. */
+    d.estop_active = true;
+    init_ok();
+    CHECK_EQ(dashboard_rev_sweep(&d, 10), EVE_OK);
+    CHECK(frame_text_count("KM/H") > 2);
+    CHECK_EQ(frame_text_count("TURN OFF THE E-STOP"), 0);
+}
+
+/* With the ECU as the data source and the start inputs not wired up yet. */
+static void test_guide_unknown_inputs(void)
+{
+    /* Power-up, ECU silent: the car is parked, so the guide shows. It can't
+     * check the e-stop or the wheel, so it goes straight to the start step. */
+    dash_data_t d = {.valid = 0, .link = DASH_LINK_WAITING, .estop_active = true};
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_UNKNOWN);
+    draw_checked(&d, "guide: nothing known");
+    CHECK_EQ(frame_text_count("PRESS START"), 1);
+    CHECK_EQ(frame_text_count("Only starts in neutral or with the clutch held"), 1);
+    CHECK_EQ(frame_text_count("NOT READY"), 0); /* no verdict it can't back up */
+    CHECK_EQ(frame_text_count("READY TO START"), 0);
+    CHECK_EQ(frame_text_count("--"), 1);        /* clutch unknown */
+    CHECK_EQ(frame_text_count("-"), 3);         /* gear unknown, steps 1 and 2 unmonitored */
+    CHECK_EQ(frame_text_count("WAITING FOR ECU"), 1);
+
+    /* Data lost, or no speed: the car might be moving, so the gauges stay. */
+    d.link = DASH_LINK_LOST;
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    d.link = DASH_LINK_CAN_FAULT;
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    d.link = DASH_LINK_OK;
+    d.valid = DASH_VALID_RPM; /* rpm 0 but speed unknown */
+    CHECK_EQ(guide_step(&d), GUIDE_NONE);
+    d.valid = DASH_VALID_RPM | DASH_VALID_SPEED;
+    CHECK_EQ(guide_step(&d), GUIDE_START);
+
+    /* Only a known input can hold a step. */
+    d.valid |= DASH_VALID_ESTOP;
+    CHECK_EQ(guide_step(&d), GUIDE_ESTOP);
+    d.estop_active = false;
+    CHECK_EQ(guide_step(&d), GUIDE_START); /* wheel still unmonitored */
+
+    /* The rule with one condition unknown: a known-met one is enough... */
+    d.valid |= DASH_VALID_GEAR;
+    d.gear = 0;
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_READY);
+    d.gear = 1;
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_UNKNOWN); /* ...in gear, clutch unknown */
+    d.valid |= DASH_VALID_CLUTCH;
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_BLOCKED);
+    d.valid &= (uint16_t)~DASH_VALID_GEAR;
+    d.clutch_held = true;
+    CHECK_EQ(guide_start_state(&d), GUIDE_START_READY);
+
+    /* Cranking needs a known rpm. */
+    d.rpm = 200;
+    d.valid &= (uint16_t)~DASH_VALID_RPM;
+    d.link = DASH_LINK_WAITING;
+    draw_checked(&d, "guide: rpm unknown");
+    CHECK_EQ(frame_text_count("CRANKING"), 0);
+    d.valid |= DASH_VALID_RPM | DASH_VALID_SPEED;
+    draw_checked(&d, "guide: cranking");
+    CHECK_EQ(frame_text_count("CRANKING"), 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * Logo
+ * ------------------------------------------------------------------------ */
+
+static int64_t cross(const logo_point_t *o, const logo_point_t *a, const logo_point_t *b)
+{
+    return (int64_t)(a->x - o->x) * (b->y - o->y) - (int64_t)(a->y - o->y) * (b->x - o->x);
+}
+
+/* Segments ab and cd cross or touch. */
+static bool segments_meet(const logo_point_t *a, const logo_point_t *b, const logo_point_t *c,
+                          const logo_point_t *d)
+{
+    const int64_t d1 = cross(c, d, a);
+    const int64_t d2 = cross(c, d, b);
+    const int64_t d3 = cross(a, b, c);
+    const int64_t d4 = cross(a, b, d);
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+        return true;
+    }
+    /* Collinear and overlapping */
+#define ON(p, q, r) (cross(p, q, r) == 0 && (r)->x >= (p->x < q->x ? p->x : q->x) && \
+                     (r)->x <= (p->x > q->x ? p->x : q->x) && (r)->y >= (p->y < q->y ? p->y : q->y) && \
+                     (r)->y <= (p->y > q->y ? p->y : q->y))
+    const bool touch = ON(c, d, a) || ON(c, d, b) || ON(a, b, c) || ON(a, b, d);
+#undef ON
+    return touch;
+}
+
+static void test_logo_outline(void)
+{
+    const uint32_t n = logo_outline_len;
+    CHECK(n >= 3);
+
+    /* The table spans exactly LOGO_WIDTH x LOGO_HEIGHT. */
+    uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX, max_x = 0, max_y = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const logo_point_t *p = &logo_outline[i];
+        min_x = p->x < min_x ? p->x : min_x;
+        min_y = p->y < min_y ? p->y : min_y;
+        max_x = p->x > max_x ? p->x : max_x;
+        max_y = p->y > max_y ? p->y : max_y;
+        const logo_point_t *q = &logo_outline[(i + 1) % n];
+        CHECK(p->x != q->x || p->y != q->y); /* no zero-length edges */
+    }
+    CHECK_EQ(min_x, 0);
+    CHECK_EQ(min_y, 0);
+    CHECK_EQ(max_x, LOGO_WIDTH);
+    CHECK_EQ(max_y, LOGO_HEIGHT);
+
+    /* A simple polygon: no edge meets another except its neighbours at the
+     * shared corner. Crossing edges would punch holes in the even-odd fill. */
+    int meets = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t j = i + 2; j < n; j++) {
+            if (i == 0 && j == n - 1) {
+                continue; /* neighbours through the wrap-around */
+            }
+            if (segments_meet(&logo_outline[i], &logo_outline[(i + 1) % n], &logo_outline[j],
+                              &logo_outline[(j + 1) % n])) {
+                printf("  edges %u and %u meet\n", (unsigned)i, (unsigned)j);
+                meets++;
+            }
+        }
+    }
+    CHECK_EQ(meets, 0);
+
+    CHECK_EQ(logo_height(LOGO_WIDTH), LOGO_HEIGHT);
+    CHECK_EQ(logo_height(320), 164);
+}
+
+static void test_logo_draw(void)
+{
+    const int32_t x = 240, y = 84, w = 320;
+    const int32_t h = logo_height(w);
+    init_ok();
+    logo_draw(x, y, w, 0xFFFFFFu);
+    CHECK_EQ(eve_cmd_flush(), EVE_OK);
+
+    /* Display list only, wrapped in a saved context. */
+    const size_t n = mock_fifo_words();
+    CHECK(n > 2 * logo_outline_len);
+    CHECK_EQ(mock_fifo_word(0), SAVE_CONTEXT());
+    CHECK_EQ(mock_fifo_word(n - 1), RESTORE_CONTEXT());
+
+    uint32_t prim = 0;
+    int strip_vertices = 0, outline_vertices = 0, stray = 0;
+    uint32_t first = 0, last = 0;
+    bool saw_invert = false, saw_fill = false, saw_clear_on_fill = false;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t word = mock_fifo_word(i);
+        CHECK((word & 0xFFFFFF00u) != 0xFFFFFF00u); /* no co-processor commands */
+        if ((word >> 24) == 0x1Fu) {
+            prim = word & 0xFu;
+            first = 0;
+        } else if (word == STENCIL_OP(KEEP, INVERT)) {
+            saw_invert = true;
+        } else if (word == STENCIL_FUNC(EQUAL, 255, 255)) {
+            saw_fill = true;
+        } else if (word == STENCIL_OP(KEEP, ZERO)) {
+            saw_clear_on_fill = saw_fill;
+        } else if ((word >> 30) == 1u && (prim == EDGE_STRIP_B || prim == LINE_STRIP)) {
+            const int32_t vx = (int32_t)((word >> 15) & 0x7FFFu);
+            const int32_t vy = (int32_t)(word & 0x7FFFu);
+            if (vx < x * 16 || vx > (x + w) * 16 || vy < y * 16 || vy > (y + h) * 16) {
+                stray++;
+            }
+            if (first == 0) {
+                first = word;
+            }
+            last = word;
+            if (prim == EDGE_STRIP_B) {
+                strip_vertices++;
+            } else {
+                outline_vertices++;
+            }
+            if (strip_vertices == (int)logo_outline_len + 1 && prim == EDGE_STRIP_B) {
+                CHECK_EQ(first, last); /* closed */
+            }
+        }
+    }
+    CHECK(saw_invert);
+    CHECK(saw_fill);
+    CHECK(saw_clear_on_fill); /* the stencil is left clear for whatever comes next */
+    CHECK_EQ(strip_vertices, logo_outline_len + 1);
+    CHECK_EQ(outline_vertices, logo_outline_len + 1);
+    CHECK_EQ(first, last); /* the outline is closed too */
+    CHECK_EQ(stray, 0);
+}
+
+static void test_rev_sweep(void)
+{
+    init_ok();
+    /* With the ECU silent the live screen would be the guide; the sweep isn't. */
     const dash_data_t base = {.rpm = 0, .speed_kph = 0, .coolant_c = 25, .fuel_pct = 50, .battery_mv = 12600,
                               .link = DASH_LINK_WAITING};
-    CHECK_EQ(dashboard_needle_sweep(&base, 300), EVE_OK);
+    CHECK_EQ(dashboard_rev_sweep(&base, 10), EVE_OK);
+    CHECK(frame_text_count("KM/H") > 2);
+    CHECK_EQ(frame_text_count("PRESS START"), 0);
     CHECK(mock_fifo_words() > 0);
 }
 
@@ -578,25 +998,62 @@ static void test_demo_data(void)
     uint16_t max_speed = 0;
     bool sane = true;
 
+    /* The start procedure: the guide steps come in order, the engine only
+     * cranks once everything allows it, and it doesn't stall afterwards. */
+    guide_step_t last_step = guide_step(&d);
+    const bool starts_at_estop = last_step == GUIDE_ESTOP;
+    bool steps_in_order = true;
+    bool saw_start_blocked = false;
+    bool saw_start_ready = false;
+    bool cranked_when_not_allowed = false;
+    bool started = false;
+    bool stalled = false;
+
     for (uint32_t t = 0; t <= 120000; t += 16) { /* two minutes at 60 fps */
         demo_data_update(&d, t);
         saw_gear[d.gear] = true;
         max_rpm = d.rpm > max_rpm ? d.rpm : max_rpm;
         max_speed = d.speed_kph > max_speed ? d.speed_kph : max_speed;
-        sane = sane && d.gear <= 5 && d.rpm >= 500 && d.rpm <= 7500 && d.speed_kph <= 260 &&
-               d.fuel_pct <= 100 && d.coolant_c >= 20 && d.coolant_c <= 100;
-        if (d.gear == 0) {
+        sane = sane && d.gear <= 5 && d.rpm <= 7500 && d.speed_kph <= 260 && d.fuel_pct <= 100 &&
+               d.coolant_c >= 20 && d.coolant_c <= 100;
+        if (d.gear == 0 || d.clutch_held || !started) {
             sane = sane && d.speed_kph == 0;
+        }
+
+        const guide_step_t step = guide_step(&d);
+        steps_in_order = steps_in_order && (step == last_step || step == last_step + 1);
+        last_step = step;
+        if (step == GUIDE_START) {
+            saw_start_blocked = saw_start_blocked || guide_start_state(&d) == GUIDE_START_BLOCKED;
+            saw_start_ready = saw_start_ready || guide_start_state(&d) == GUIDE_START_READY;
+        }
+        if (!started && d.rpm >= GUIDE_RPM_CRANKING) {
+            cranked_when_not_allowed =
+                cranked_when_not_allowed || d.estop_active || !d.wheel_connected ||
+                guide_start_state(&d) != GUIDE_START_READY;
+        }
+        if (dash_engine_running(&d)) {
+            started = true;
+        } else {
+            stalled = stalled || started;
         }
     }
     CHECK(sane);
+    CHECK(starts_at_estop);
+    CHECK(steps_in_order);
+    CHECK_EQ(last_step, GUIDE_NONE);
+    CHECK(saw_start_blocked); /* the demo shows the rule being enforced... */
+    CHECK(saw_start_ready);   /* ...and met */
+    CHECK(!cranked_when_not_allowed);
+    CHECK(started);
+    CHECK(!stalled);
     for (int g = 0; g <= 5; g++) {
         CHECK(saw_gear[g]);
     }
     CHECK(max_rpm >= 6500);
     CHECK(max_speed >= 150);
     CHECK_EQ(d.coolant_c >= 88, 1); /* warmed up */
-    CHECK_EQ(d.valid, DASH_VALID_ALL);
+    CHECK_EQ(d.valid, DASH_VALID_ALL | DASH_VALID_INPUTS); /* the start inputs too */
     CHECK_EQ(d.link, DASH_LINK_DEMO);
 }
 
@@ -1180,7 +1637,12 @@ int main(void)
     RUN(test_render_splash);
     RUN(test_render_dashboard);
     RUN(test_render_validity_and_status);
-    RUN(test_needle_sweep);
+    RUN(test_dashboard_alerts);
+    RUN(test_guide_screens);
+    RUN(test_guide_unknown_inputs);
+    RUN(test_logo_outline);
+    RUN(test_logo_draw);
+    RUN(test_rev_sweep);
     RUN(test_fixmath);
     RUN(test_demo_data);
     RUN(test_can_queue);
