@@ -12,19 +12,25 @@ add_executable(host_tests
     test_main.c
     mock_eve.c
     mock_can.c
+    mock_encoder.c
     ${SRC}/eve/eve.c
     ${SRC}/eve/eve_panels.c
+    ${SRC}/app/dash_menu.c
     ${SRC}/app/dashboard.c
     ${SRC}/app/demo_data.c
     ${SRC}/app/ecu_link.c
     ${SRC}/app/fixmath.c
     ${SRC}/app/guide.c
+    ${SRC}/app/knob.c
     ${SRC}/app/logo.c
+    ${SRC}/app/menu.c
+    ${SRC}/app/pages.c
     ${SRC}/app/rusefi_can.c
+    ${SRC}/app/settings.c
     ${SRC}/app/ui.c
 )
 
-target_include_directories(host_tests PRIVATE . ${SRC}/eve ${SRC}/can ${SRC}/app)
+target_include_directories(host_tests PRIVATE . ${SRC} ${SRC}/eve ${SRC}/can ${SRC}/input ${SRC}/app)
 target_compile_definitions(host_tests PRIVATE _GNU_SOURCE)
 target_compile_options(host_tests PRIVATE -Wall -Wextra -Wno-unused-parameter
                        -fsanitize=address,undefined -fno-omit-frame-pointer)
@@ -39,12 +45,19 @@ add_test(NAME host_tests COMMAND host_tests)
 add_executable(preview_dump
     preview_dump.c
     mock_eve.c
+    mock_can.c
+    mock_encoder.c
     ${SRC}/eve/eve.c
     ${SRC}/eve/eve_panels.c
+    ${SRC}/app/dash_menu.c
     ${SRC}/app/dashboard.c
     ${SRC}/app/fixmath.c
     ${SRC}/app/guide.c
+    ${SRC}/app/knob.c
     ${SRC}/app/logo.c
+    ${SRC}/app/menu.c
+    ${SRC}/app/pages.c
+    ${SRC}/app/settings.c
     ${SRC}/app/ui.c
 )
-target_include_directories(preview_dump PRIVATE . ${SRC} ${SRC}/eve ${SRC}/app)
+target_include_directories(preview_dump PRIVATE . ${SRC} ${SRC}/eve ${SRC}/can ${SRC}/input ${SRC}/app)

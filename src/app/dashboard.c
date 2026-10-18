@@ -5,6 +5,8 @@
 #include "eve_hal.h"
 #include "guide.h"
 #include "logo.h"
+#include "menu.h"
+#include "settings.h"
 #include "ui.h"
 
 /*
@@ -24,6 +26,9 @@
  *   +----------------------------------------------------------------+
  *
  * Values the ECU isn't currently sending (see dash_data_t.valid) show "--".
+ *
+ * While the menu is open (menu.h) it takes the screen below the shift lights
+ * and rev bar, which stay, and the alert moves to the right of its title.
  */
 
 /* Engine and warning thresholds */
@@ -78,6 +83,12 @@
 #define ALERT_X1 512
 #define ALERT_Y0 284
 #define ALERT_Y1 318
+
+/* The alert's place while the menu is open: right of the menu's title */
+#define MENU_ALERT_X0 560
+#define MENU_ALERT_X1 784
+#define MENU_ALERT_Y0 (MENU_HEADER_Y - 17)
+#define MENU_ALERT_Y1 (MENU_HEADER_Y + 17)
 
 /* Warning lamps either side of it, under speed and rpm */
 #define LAMP_W 200
@@ -312,15 +323,18 @@ static void draw_gear(const dash_data_t *d, uint32_t rpm, bool flash_on)
 
 static void draw_speed_rpm(const dash_data_t *d)
 {
+    const bool mph = g_settings.speed_units == SPEED_MPH;
     if (dash_valid(d, DASH_VALID_SPEED)) {
+        /* 1 mile = 1.609344 km */
+        const uint32_t speed = mph ? (d->speed_kph * 10000u + 8047u) / 16093u : d->speed_kph;
         eve_color(COL_TEXT);
-        eve_cmd_number(SPEED_X, VALUE_Y, FONT_HUGE, OPT_CENTER, (int32_t)d->speed_kph);
+        eve_cmd_number(SPEED_X, VALUE_Y, FONT_HUGE, OPT_CENTER, (int32_t)speed);
     } else {
         eve_color(COL_TEXT_DIM);
         eve_cmd_text(SPEED_X, VALUE_Y, FONT_HUGE, OPT_CENTER, NO_VALUE);
     }
     eve_color(COL_TEXT_DIM);
-    eve_cmd_text(SPEED_X, VALUE_Y + 64, FONT_SMALL, OPT_CENTER, "KM/H");
+    eve_cmd_text(SPEED_X, VALUE_Y + 64, FONT_SMALL, OPT_CENTER, mph ? "MPH" : "KM/H");
 
     /* rpm is also on the bar and the shift lights, so it gets the smaller font. */
     if (dash_valid(d, DASH_VALID_RPM)) {
@@ -353,9 +367,10 @@ static void draw_lamps(uint8_t warnings)
     }
 }
 
-/* The most severe alert, plus how many more there are. Critical ones flash.
- * When everything is normal the slot stays empty. */
-static void draw_alert(const vital_status_t *s, uint32_t count, uint32_t now_ms)
+/* The most severe alert, plus how many more there are, in the box x0..x1,
+ * y0..y1. Critical ones flash. When everything is normal it stays empty. */
+static void draw_alert(const vital_status_t *s, uint32_t count, uint32_t now_ms, int32_t x0, int32_t y0,
+                       int32_t x1, int32_t y1)
 {
     const vital_status_t *top = NULL;
     uint32_t active = 0u;
@@ -377,9 +392,9 @@ static void draw_alert(const vital_status_t *s, uint32_t count, uint32_t now_ms)
     } else {
         snprintf(text, sizeof text, "%s", top->alert);
     }
-    ui_rect(ALERT_X0, ALERT_Y0, ALERT_X1, ALERT_Y1, level_colour(top->level), (ALERT_Y1 - ALERT_Y0) / 2);
+    ui_rect(x0, y0, x1, y1, level_colour(top->level), (y1 - y0) / 2);
     eve_color(COL_BG);
-    eve_cmd_text((ALERT_X0 + ALERT_X1) / 2, (ALERT_Y0 + ALERT_Y1) / 2, FONT_SMALL, OPT_CENTER, text);
+    eve_cmd_text((int16_t)((x0 + x1) / 2), (int16_t)((y0 + y1) / 2), FONT_SMALL, OPT_CENTER, text);
 }
 
 /* ---------------------------------------------------------------------------
@@ -412,14 +427,8 @@ static void draw_tile(uint32_t index, const tile_t *t)
     eve_color(COL_TEXT_DIM);
     eve_cmd_text((int16_t)(x0 + TILE_PAD), TILE_Y0 + 20, FONT_TINY, OPT_CENTERY, t->label);
     eve_cmd_text((int16_t)(x1 - 16), TILE_Y0 + 20, FONT_TINY, OPT_RIGHTX | OPT_CENTERY, t->unit);
-    if (t->degree) { /* the ROM fonts are ASCII only */
-        eve_cmd(BEGIN(POINTS));
-        eve_cmd(POINT_SIZE(3 * 16));
-        eve_cmd(VERTEX2F((x1 - 32) * 16, (TILE_Y0 + 16) * 16));
-        eve_color(COL_PANEL);
-        eve_cmd(POINT_SIZE(26));
-        eve_cmd(VERTEX2F((x1 - 32) * 16, (TILE_Y0 + 16) * 16));
-        eve_cmd(END());
+    if (t->degree) {
+        ui_degree(x1 - 32, TILE_Y0 + 16, COL_TEXT_DIM, COL_PANEL);
     }
 
     /* Value, and a status word only when there is something to say */
@@ -441,8 +450,21 @@ static void draw_tile(uint32_t index, const tile_t *t)
     ui_rect(bx0, by0, bx0 + (int32_t)(t->fill * bw / 1000u), by1, colour, 2);
 }
 
+/* What each vitals tile says: coolant, fuel, battery. A value the ECU
+ * isn't sending has nothing to judge, so no status. */
+static void vitals_status(const dash_data_t *d, vital_status_t status[TILE_COUNT])
+{
+    const vital_status_t none = {LEVEL_OK, NULL, NULL};
+    status[0] = dash_valid(d, DASH_VALID_COOLANT) ? coolant_status(d->coolant_c) : none;
+    status[1] = dash_valid(d, DASH_VALID_FUEL) ? fuel_status(d->fuel_pct) : none;
+    status[2] = dash_valid(d, DASH_VALID_BATTERY) ? battery_status(d->battery_mv, dash_engine_running(d)) : none;
+}
+
 static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
 {
+    vital_status_t status[TILE_COUNT];
+    vitals_status(d, status);
+
     char coolant[8];
     char fuel[8];
     char battery[8];
@@ -459,7 +481,7 @@ static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
             .fill = clamp_permille(d->coolant_c, COOLANT_BAR_MIN, COOLANT_BAR_MAX),
             .zone_lo = clamp_permille(COOLANT_HOT_C, COOLANT_BAR_MIN, COOLANT_BAR_MAX),
             .zone_hi = 1000u,
-            .status = coolant_status(d->coolant_c),
+            .status = status[0],
         },
         {
             .label = "FUEL", .unit = "%", .value = fuel,
@@ -467,7 +489,7 @@ static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
             .fill = clamp_permille(d->fuel_pct, 0, 100),
             .zone_lo = 0u,
             .zone_hi = clamp_permille(FUEL_LOW_PCT, 0, 100),
-            .status = fuel_status(d->fuel_pct),
+            .status = status[1],
         },
         {
             .label = "BATTERY", .unit = "V", .value = battery,
@@ -475,21 +497,18 @@ static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
             .fill = clamp_permille(d->battery_mv, BATT_BAR_MIN, BATT_BAR_MAX),
             .zone_lo = 0u,
             .zone_hi = clamp_permille(BATT_LOW_MV, BATT_BAR_MIN, BATT_BAR_MAX),
-            .status = battery_status(d->battery_mv, dash_engine_running(d)),
+            .status = status[2],
         },
     };
 
-    vital_status_t status[TILE_COUNT];
     for (uint32_t i = 0u; i < TILE_COUNT; i++) {
-        if (!tiles[i].known) { /* nothing to judge: empty bar, no status */
+        if (!tiles[i].known) { /* empty bar */
             tiles[i].value = NO_VALUE;
             tiles[i].fill = 0u;
-            tiles[i].status = (vital_status_t){LEVEL_OK, NULL, NULL};
         }
         draw_tile(i, &tiles[i]);
-        status[i] = tiles[i].status;
     }
-    draw_alert(status, TILE_COUNT, now_ms);
+    draw_alert(status, TILE_COUNT, now_ms, ALERT_X0, ALERT_Y0, ALERT_X1, ALERT_Y1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -567,21 +586,30 @@ static void draw_link_status(dash_link_t link)
     eve_cmd_text(SCREEN_W - 16, SCREEN_H - 16, font, OPT_RIGHTX | OPT_CENTERY, text);
 }
 
-/* One frame of the pre-start guide, or of the main screen when there is no
- * guide step to show or `guide` is false. */
-static eve_status_t draw_frame(const dash_data_t *d, uint32_t now_ms, bool guide)
+/* One frame of the live screen: the menu if it's open, else the pre-start
+ * guide, else the main screen. With `live` false, always the main screen. */
+static eve_status_t draw_frame(const dash_data_t *d, uint32_t now_ms, bool live)
 {
-    const guide_step_t step = guide ? guide_step(d) : GUIDE_NONE;
+    const bool menu = live && menu_is_open();
+    const guide_step_t step = live && !menu ? guide_step(d) : GUIDE_NONE;
+    /* 5 Hz shift flash, or steady if the driver turned it off */
+    const bool flash_on = g_settings.shift_flash == 0 || ((now_ms / 100u) & 1u) == 0u;
+    const uint32_t rpm = dash_valid(d, DASH_VALID_RPM) ? d->rpm : 0u; /* lights off without data */
 
     eve_cmd_dlstart();
     eve_cmd(CLEAR_COLOR_RGB(0, 0, 0));
     eve_cmd(CLEAR(1, 1, 1));
 
-    if (step != GUIDE_NONE) {
+    if (menu) {
+        vital_status_t status[TILE_COUNT];
+        vitals_status(d, status);
+        draw_shift_lights(rpm, flash_on);
+        draw_rev_bar(rpm);
+        menu_draw(d, now_ms);
+        draw_alert(status, TILE_COUNT, now_ms, MENU_ALERT_X0, MENU_ALERT_Y0, MENU_ALERT_X1, MENU_ALERT_Y1);
+    } else if (step != GUIDE_NONE) {
         guide_draw(d, step, now_ms);
     } else {
-        const bool flash_on = ((now_ms / 100u) & 1u) == 0u; /* 5 Hz shift flash */
-        const uint32_t rpm = dash_valid(d, DASH_VALID_RPM) ? d->rpm : 0u; /* lights off without data */
         ui_attach_fonts();
         draw_shift_lights(rpm, flash_on);
         draw_rev_bar(rpm);

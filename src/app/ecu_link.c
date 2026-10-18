@@ -140,22 +140,46 @@ void ecu_link_get_dash(dash_data_t *d, uint32_t now_ms)
     if (rusefi_fresh(e, RUSEFI_MSG_SPEEDS, now_ms, ECU_DATA_TIMEOUT_MS)) {
         d->rpm = smooth_rpm(e->rpm, now_ms);
         d->speed_kph = e->speed_kph;
-        d->valid |= DASH_VALID_RPM | DASH_VALID_SPEED;
+        d->timing_deg_x10 = (int16_t)(e->timing_deg_x50 / 5);
+        d->valid |= DASH_VALID_RPM | DASH_VALID_SPEED | DASH_VALID_TIMING;
     } else {
         s_rpm_shown_valid = false;
     }
     s_last_dash_ms = now_ms;
 
+    if (rusefi_fresh(e, RUSEFI_MSG_PEDAL_TPS, now_ms, ECU_DATA_TIMEOUT_MS) &&
+        e->tps1_pct_x100 != RUSEFI_PCT_NO_SENSOR) {
+        const int32_t tps = (e->tps1_pct_x100 + 50) / 100;
+        d->throttle_pct = (uint8_t)(tps < 0 ? 0 : (tps > 100 ? 100 : tps));
+        d->valid |= DASH_VALID_THROTTLE;
+    }
+
     if (rusefi_fresh(e, RUSEFI_MSG_SENSORS1, now_ms, ECU_DATA_TIMEOUT_MS)) {
         d->coolant_c = e->coolant_c;
         const uint32_t fuel = (e->fuel_level_pct_x2 + 1u) / 2u;
         d->fuel_pct = (uint8_t)(fuel > 100u ? 100u : fuel);
-        d->valid |= DASH_VALID_COOLANT | DASH_VALID_FUEL;
+        d->map_kpa = (uint16_t)((e->map_kpa_x30 + 15u) / 30u);
+        d->intake_c = e->intake_c;
+        d->valid |= DASH_VALID_COOLANT | DASH_VALID_FUEL | DASH_VALID_INTAKE;
     }
 
     if (rusefi_fresh(e, RUSEFI_MSG_SENSORS2, now_ms, ECU_DATA_TIMEOUT_MS)) {
         d->battery_mv = e->battery_mv;
         d->valid |= DASH_VALID_BATTERY;
+        if (e->oil_press_kpa_x30 != RUSEFI_OIL_PRESS_NO_SENSOR) {
+            /* A reading just below 0 arrives wrapped, like the no-sensor
+             * value; no oil pressure sensor reaches the 1092 kPa where
+             * reading the field as signed would go wrong. */
+            const int32_t oil = (int16_t)e->oil_press_kpa_x30;
+            d->oil_kpa = (uint16_t)(oil <= 0 ? 0 : (oil + 15) / 30);
+            d->valid |= DASH_VALID_OIL_PRESS;
+        }
+    }
+
+    /* 0 is what rusEFI sends without a wideband: no real mixture reads that. */
+    if (rusefi_fresh(e, RUSEFI_MSG_FUELING3, now_ms, ECU_DATA_TIMEOUT_MS) && e->lambda_x10000[0] != 0u) {
+        d->lambda_x1000 = (uint16_t)((e->lambda_x10000[0] + 5u) / 10u);
+        d->valid |= DASH_VALID_LAMBDA;
     }
 
     if (rusefi_fresh(e, RUSEFI_MSG_STATUS, now_ms, ECU_DATA_TIMEOUT_MS)) {

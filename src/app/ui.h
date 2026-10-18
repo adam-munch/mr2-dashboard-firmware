@@ -65,6 +65,10 @@ void ui_dot(int32_t cx, int32_t cy, int32_t r, uint32_t rgb);
 /* Tick mark sized for a ~24 px badge, centred on (cx, cy). */
 void ui_check(int32_t cx, int32_t cy, uint32_t rgb);
 
+/* Degree sign for FONT_TINY units, since the ROM fonts are ASCII only: a
+ * small ring centred on (cx, cy) on a `bg` background. */
+void ui_degree(int32_t cx, int32_t cy, uint32_t rgb, uint32_t bg);
+
 /* Left edge of item `i` of `n` spread across x0..x1 with `gap` pixels between. */
 int32_t ui_spread_x(uint32_t i, uint32_t n, int32_t x0, int32_t x1, int32_t gap);
 

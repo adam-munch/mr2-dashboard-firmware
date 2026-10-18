@@ -8,7 +8,8 @@
  *
  * Then a repeating drive cycle: idle, pull through the gears, coast down
  * through the gears, idle again. Gearing is roughly an SW20 MR2 (E153
- * gearbox, 4.285 final drive, 225/50R15 rear tyres).
+ * gearbox, 4.285 final drive, 225/50R15 rear tyres), and the engine data
+ * page shows boost and a rich mixture on the pulls, vacuum on the overrun.
  */
 
 /* km/h per 1000 rpm, x10, per gear (index 0 = neutral). */
@@ -33,6 +34,13 @@ static const uint16_t k_accel_rpm_s[6] = {0, 3500, 2200, 1500, 1000, 700};
 #define FIRE_MS          10800u
 #define CRANK_RPM        200u
 #define PARKED_MV        12500u
+
+/* Engine data page: roughly a 3S-GTE, with boost under load. */
+#define ATMOSPHERE_KPA   101u
+#define IDLE_MAP_KPA     38u
+#define OVERRUN_MAP_KPA  28u
+#define BOOST_MAP_KPA    180u /* about 0.8 bar of boost */
+#define AMBIENT_C        25
 
 typedef enum {
     PHASE_PRESTART,
@@ -73,12 +81,18 @@ void demo_data_init(dash_data_t *d, uint32_t now_ms)
     d->fuel_pct = 72u;
     d->battery_mv = PARKED_MV;
     d->gear = 1u;
-    d->valid = DASH_VALID_ALL | DASH_VALID_INPUTS;
+    d->valid = (uint16_t)((DASH_VALID_ALL | DASH_VALID_INPUTS) & ~DASH_VALID_LAMBDA); /* engine off */
     d->warnings = 0u;
     d->link = DASH_LINK_DEMO;
     d->estop_active = true;
     d->wheel_connected = false;
     d->clutch_held = false;
+    d->oil_kpa = 0u;
+    d->lambda_x1000 = 0u;
+    d->map_kpa = ATMOSPHERE_KPA;
+    d->intake_c = AMBIENT_C;
+    d->throttle_pct = 0u;
+    d->timing_deg_x10 = 0;
 
     s_phase = PHASE_PRESTART;
     s_rpm_x1000 = 0u;
@@ -197,6 +211,63 @@ static void update_gauges(dash_data_t *d, uint32_t dt)
     d->battery_mv = d->rpm > 1500u ? 14200u : 13800u;
 }
 
+static void update_engine(dash_data_t *d)
+{
+    const bool running = dash_engine_running(d);
+    uint32_t map = ATMOSPHERE_KPA;
+    uint8_t throttle = 0u;
+    int32_t timing = 0;
+    uint16_t lambda = 1000u;
+
+    switch (s_phase) {
+    case PHASE_PRESTART:
+        if (d->rpm > 0u) { /* cranking */
+            map = 95u;
+            timing = 100;
+        }
+        break;
+    case PHASE_IDLE:
+        map = IDLE_MAP_KPA;
+        timing = 120;
+        break;
+    case PHASE_ACCEL: {
+        /* Full throttle: the turbo builds boost from ~1500 rpm, rich, with
+         * timing pulled back as the boost rises. */
+        const uint32_t rpm = d->rpm > 1500u ? d->rpm - 1500u : 0u;
+        map = 90u + rpm * (BOOST_MAP_KPA - 90u) / 3000u;
+        map = map > BOOST_MAP_KPA ? BOOST_MAP_KPA : map;
+        throttle = 100u;
+        timing = 280 - ((int32_t)map - 100) * 10 / 8;
+        lambda = 820u;
+        break;
+    }
+    case PHASE_DECEL:
+        map = OVERRUN_MAP_KPA;
+        timing = 250;
+        lambda = 1100u;
+        break;
+    case PHASE_SHIFT:
+        map = 45u;
+        timing = 150;
+        break;
+    }
+
+    d->map_kpa = (uint16_t)map;
+    d->throttle_pct = throttle;
+    d->timing_deg_x10 = (int16_t)timing;
+    d->intake_c = (int16_t)(AMBIENT_C + 3 + (map > 100u ? (int32_t)(map - 100u) / 8 : 0)); /* intercooled */
+
+    /* Oil pressure rises with the revs. The wideband only reads once the
+     * engine runs (the sensor needs exhaust to heat it). */
+    d->oil_kpa = running ? (uint16_t)(150u + d->rpm * 40u / 1000u) : 0u;
+    d->lambda_x1000 = running ? lambda : 0u;
+    if (running) {
+        d->valid |= DASH_VALID_LAMBDA;
+    } else {
+        d->valid &= (uint16_t)~DASH_VALID_LAMBDA;
+    }
+}
+
 void demo_data_update(dash_data_t *d, uint32_t now_ms)
 {
     uint32_t dt = now_ms - s_last_ms;
@@ -207,4 +278,5 @@ void demo_data_update(dash_data_t *d, uint32_t now_ms)
 
     update_drivetrain(d, now_ms, dt);
     update_gauges(d, dt);
+    update_engine(d);
 }

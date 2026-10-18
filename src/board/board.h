@@ -126,6 +126,47 @@
 #define CAN_STBY_PIN  7u
 
 /* ---------------------------------------------------------------------------
+ * Rotary encoder with push switch, for the menus (Bourns PEC11L-4120K-S0020:
+ * 20 detents, 20 pulses per turn, momentary push switch)
+ *
+ *   Encoder pin       MCU pin (default)
+ *   ---------------   ------------------------------
+ *   A                 PB4  TIM3_CH1 (AF1)
+ *   B                 PB5  TIM3_CH2 (AF1)
+ *   C (common)        GND
+ *   switch            PB3  GPIO input; the switch's other pin to GND
+ *
+ * The timer counts every edge of A and B in hardware (encoder mode), so no
+ * click is lost while the main loop is busy drawing. A and B must be CH1
+ * and CH2 of one timer with an encoder interface (TIM1, TIM2, TIM3 or TIM4):
+ * check the datasheet's alternate function table before moving them.
+ *
+ * The MCU's internal pull-ups (~40 kOhm) are switched on. In a car, fit what
+ * Bourns suggests on A and B as well: 10 kOhm pull-ups to 3.3 V, then 10 kOhm
+ * in series with 10 nF to GND at the MCU pin. The contacts bounce for up to
+ * a few ms; counting is immune to that, and the switch is debounced in
+ * software (knob.c).
+ * ------------------------------------------------------------------------ */
+
+#define BOARD_HAS_ENCODER 1
+
+#define ENC_TIM              TIM3
+#define ENC_TIM_CLK_ENABLE() (RCC->APBENR1 |= RCC_APBENR1_TIM3EN)
+
+#define ENC_A_PORT  GPIOB
+#define ENC_A_PIN   4u
+#define ENC_A_AF    1u
+
+#define ENC_B_PORT  GPIOB
+#define ENC_B_PIN   5u
+#define ENC_B_AF    1u
+
+#define ENC_SW_PORT GPIOB
+#define ENC_SW_PIN  3u
+
+#define ENC_REVERSE 0 /* 1: turning clockwise counts down (A and B swapped) */
+
+/* ---------------------------------------------------------------------------
  * Debug UART (TX only, 115200 8N1). printf() goes here.
  * ------------------------------------------------------------------------ */
 

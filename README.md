@@ -22,7 +22,8 @@ team logo, three start lights in.*
 ## What it does
 
 1. Brings up the clock (64 MHz from a crystal or HSI16), SysTick, SPI1, the
-   debug UART and the CAN controller (FDCAN1, 500 kbit/s).
+   debug UART, the CAN controller (FDCAN1, 500 kbit/s) and the rotary knob
+   (TIM3 in encoder mode).
 2. Resets and initialises the FT812 using the timing from the NHD datasheet.
 3. Shows a splash screen with the team logo, fades the backlight in, runs five
    F1-style start lights, and on "lights out" sweeps the rev bar to the stop
@@ -30,7 +31,9 @@ team logo, three start lights in.*
 4. Walks the driver through starting the engine, one screen per step (see
    [Pre-start guide](#pre-start-guide)), then runs the main screen at about
    60 fps (see [Screen](#screen)), all from the ECU's CAN broadcast.
-5. Sends a status frame back to the ECU 10 times a second (see
+5. Opens a menu when the knob is pressed: settings, more engine data and
+   diagnostics (see [Menu](#menu)).
+6. Sends a status frame back to the ECU 10 times a second (see
    [Dashboard → ECU](#dashboard--ecu)).
 
 If the display stops responding (cable unplugged, co-processor fault), the
@@ -108,6 +111,62 @@ e-stop released at 3 s, wheel in at 6 s, first gear still selected so start
 is blocked until the clutch goes down at 8.5 s, then cranking at 10 s and the
 engine catching at 10.8 s.
 
+### Menu
+
+![Menu: the list while driving, a value being changed, the engine data and diagnostics pages](docs/menu-preview.png)
+
+Press the knob (a Bourns PEC11L rotary encoder with a push switch) to open
+the menu over the main screen or the pre-start guide. The shift lights and
+rev bar stay at the top, and if anything needs attention, the alert from the
+main screen shows next to the menu's title, flashing as usual.
+
+| Knob | In a list | Changing a value | On a page |
+|---|---|---|---|
+| Turn | move the highlight | change it | next or previous page |
+| Press | open, change, switch or run the item | keep the new value | back to the list |
+| Hold (0.6 s) | up a level, or close the menu | cancel and put it back | back to the list |
+
+Every list ends with a `BACK` row (`EXIT` at the top), and the bottom line
+says what the knob does on the current screen. A list left alone for 10 s
+closes by itself, so the menu never covers the gauges for long. If a
+value is being changed at that point, it's dropped, except for brightness,
+which keeps what it was turned to. Pages stay up until you leave them,
+since they're there to be watched.
+
+The demo items (`src/app/dash_menu.c`):
+
+| Item | Type | What it does |
+|---|---|---|
+| ENGINE DATA | page | Oil pressure, lambda, MAP, intake air, throttle and ignition timing from the ECU, `--` for any it isn't sending or has no sensor for |
+| DISPLAY › BRIGHTNESS | value, 10–100 % | Backlight. Changes while you turn, so you can see it |
+| DISPLAY › SPEED UNITS | choice | KM/H or MPH on the main screen |
+| DISPLAY › SHIFT FLASH | on/off | Off: the shift lights and gear box stay lit at the shift point instead of flashing |
+| ECU MODE | value, 0–9 | Sent to the ECU in the status frame (byte 4). Only the value you keep goes out, not the ones you turn past on the way |
+| DIAGNOSTICS | page | Firmware version, display chip, uptime, the knob's raw count and switch, ECU link, CAN state and counters |
+| RESTORE DEFAULTS | action | All settings back to their defaults |
+
+Settings live in RAM, so they're back to the defaults at every power-up.
+
+**Adding to the menu.** The menu is a tree of `const` tables in flash, one
+line per item, built with the macros in `src/app/menu.h`:
+
+```c
+static const menu_item_t k_display[] = {
+    MENU_VALUE_ITEM("BRIGHTNESS", g_settings.brightness_pct, 10, 100, 10, "%", MENU_LIVE),
+    MENU_CHOICE_ITEM("SPEED UNITS", g_settings.speed_units, k_speed_units, 0u),
+    MENU_TOGGLE_ITEM("SHIFT FLASH", g_settings.shift_flash),
+};
+```
+
+A new setting is a field in `settings_t` (`src/app/settings.h`), a line in
+a table, and the code that reads it. Item types: `MENU_SUBMENU` (a nested
+list, up to 4 deep), `MENU_PAGE` (a draw function for the area under the
+title), `MENU_VALUE` (a number with range, step and unit), `MENU_CHOICE` (one
+of a list of names), `MENU_TOGGLE` and `MENU_ACTION` (a function, which can
+return a message to show, like `DEFAULTS RESTORED`). Values and choices are
+written when kept; add `MENU_LIVE` to write them at every click instead, for
+settings you want to see change.
+
 ### Team logo
 
 The splash logo is stored as its outline, not as a bitmap: 34 corner points,
@@ -138,6 +197,7 @@ the declared size.
 | Display | NHD-7.0-800480FT-CSXP: FT812, 800×480, no touch panel |
 | Display link | SPI mode 0. 8 MHz during init, 16 MHz after |
 | ECU link | CAN 2.0, 500 kbit/s, via a 3.3 V transceiver (TJA1051T/3, SN65HVD230, MCP2562…) |
+| Knob | Bourns PEC11L-4120K-S0020: 20 detents and 20 pulses per turn (4 edges per click), push switch |
 
 ### Default pin map
 
@@ -164,6 +224,9 @@ Other defaults:
 |---|---|---|
 | CAN TX → transceiver TXD | **PB9** (FDCAN1_TX, AF3) | `CAN_TX_*` |
 | CAN RX ← transceiver RXD | **PB8** (FDCAN1_RX, AF3) | `CAN_RX_*`, pull-up |
+| Knob A | **PB4** (TIM3_CH1, AF1) | `ENC_A_*`, pull-up |
+| Knob B | **PB5** (TIM3_CH2, AF1) | `ENC_B_*`, pull-up |
+| Knob switch (other pin to GND) | **PB3** | `ENC_SW_*`, GPIO input with pull-up |
 | Transceiver S/STBY/Rs | PB7 | `BOARD_HAS_CAN_STBY`, **off by default**: tie the pin low on the board, or enable this |
 | Crystal | PF0 / PF1 | `BOARD_HSE_HZ`, **0 (none) by default** |
 | Debug UART TX | **PA2** (USART2, AF1) | `BOARD_HAS_DEBUG_UART`, 115200 8N1 |
@@ -174,6 +237,18 @@ Other defaults:
 on the main connector). A CAN bus needs a 120 Ω terminator at each end. The
 ECU usually has one; fit the other at the dash if it's the far end.
 
+**Knob wiring.** The encoder's common pin C and one side of its switch go
+to GND. TIM3 counts every edge of A and B in hardware (encoder mode, through
+its longest input filter), so no click is lost while a frame is drawn. A and
+B must be CH1 and CH2 of one timer if you move them. The MCU's ~40 kΩ
+pull-ups are on, which is enough on the bench; in the car, fit what Bourns
+suggests on A and B: 10 kΩ pull-ups to 3.3 V, then 10 kΩ in series with
+10 nF to GND at the MCU pin. If clockwise moves the highlight up instead of
+down, set `ENC_REVERSE` in `board.h`. For an encoder with a different
+number of pulses per click, set `ENCODER_COUNTS_PER_DETENT`
+(`src/input/encoder.h`). Set `BOARD_HAS_ENCODER` to 0 for a board without
+one.
+
 **Fit a crystal.** With this firmware's CAN bit timing (81.25 % sample point,
 SJW 3), the dash's clock can be at most about 1.4 % off from the ECU's.
 HSI16 is ±1 % at best and drifts further at temperature extremes, so it works
@@ -182,8 +257,9 @@ typical) on PF0/PF1 and set `BOARD_HSE_HZ` in `board.h`. If it doesn't start,
 the firmware falls back to HSI16 and says so at boot.
 
 The backlight at full brightness draws a lot of current. Make sure the VBL
-supply can deliver it, or lower `BACKLIGHT_DUTY` in `src/main.c` (0–128) for
-bench testing.
+supply can deliver it, or turn the brightness down in the menu, or lower
+`BACKLIGHT_DUTY` in `src/main.c` (0–128, the duty at 100 %) for bench
+testing.
 
 ## Building
 
@@ -226,7 +302,7 @@ openocd -f interface/stlink.cfg -f target/stm32g0x.cfg \
 Connect a 3.3 V USB-UART to PA2 at 115200 8N1. `printf()` output goes there:
 
 ```
-MR2 dashboard firmware 0.2.0
+MR2 dashboard firmware 0.3.0
 SYSCLK 64000000 Hz from crystal
 CAN: 500 kbit/s, rusEFI broadcast at 0x200, dash status at 0x6D0
 EVE: initialising
@@ -282,8 +358,10 @@ ECU --CAN--> FDCAN1 --interrupt--> receive queue (64 frames, timestamped)
 
 All 12 broadcast messages are decoded (`src/app/rusefi_can.c`): MAP, IAT,
 TPS/pedal, oil pressure and temperature, lambda, fuel pressure, trims, EGTs,
-cams, knock and so on. They're available through `ecu_link_data()` for future
-screens.
+cams, knock and so on. Oil pressure, lambda, MAP, intake air, throttle and
+ignition timing are on the menu's ENGINE DATA page, each with its own
+`DASH_VALID_*` bit, so a sensor the ECU doesn't have shows `--`. All of them
+are available through `ecu_link_data()` for other screens.
 
 The ECU updates rpm 20 times a second and the screen redraws 60 times, so rpm
 is low-pass filtered (`ECU_RPM_SMOOTH_MS`, 40 ms) to move smoothly.
@@ -313,7 +391,7 @@ The dash sends an 8-byte status frame on ID **0x6D0** (`DASH_TX_ID`) every
 | 0 | Counter, +1 per frame |
 | 1 | Flags: bit 0 display running, bit 1 dash is receiving ECU data |
 | 2–3 | Inputs, little-endian: bit *n* = input *n* active (`ecu_link_set_inputs()`) |
-| 4 | Mode (`ecu_link_set_mode()`) |
+| 4 | Mode (`ecu_link_set_mode()`): the menu's ECU MODE, 0–9 |
 | 5–7 | 0, reserved |
 
 rusEFI hands frames like this to its Lua engine.
@@ -338,12 +416,13 @@ a receive-only dash.
 | `WAITING FOR ECU` forever | ECU broadcast enabled, base address 0x200, 11-bit; same bit rate both ends; CANH/CANL not swapped; transceiver powered and its S/STBY pin low; TX/RX not swapped at the MCU |
 | `NO DATA FROM ECU` with TEC/REC climbing in the log | Bit-rate or clock mismatch: fit a crystal (`BOARD_HSE_HZ`); check termination (about 60 Ω between CANH and CANL with the power off) |
 | `CAN BUS FAULT` | Bus shorted, or the dash is alone on a bus at the wrong bit rate. It retries every 100 ms |
+| Knob does nothing, or skips | Open MENU › DIAGNOSTICS (if a press opens the menu): KNOB COUNT should move by 4 per click, up for clockwise (else `ENC_REVERSE`), and KNOB SWITCH should follow the shaft. Check A/B on PB4/PB5 and C to GND; fit the RC filter if clicks are missed or doubled |
 
 ## Tests and preview
 
-The EVE driver, the CAN pipeline, the renderer and the simulation are covered
-by host tests that run on a PC against a simulated FT812 and a mock CAN
-driver. The FT812 simulation decodes the SPI frames the way the chip does.
+The EVE driver, the CAN pipeline, the renderer, the knob, the menus and the
+simulation are covered by host tests that run on a PC against a simulated
+FT812, a mock CAN driver and a mock encoder. The FT812 simulation decodes the SPI frames the way the chip does.
 The tests check:
 
 - the power-up sequence and its timing
@@ -362,6 +441,16 @@ The tests check:
   timeout, rpm smoothing
 - the dash status frame: layout, timing, behaviour when nobody acknowledges it
 - the receive queue across index wrap-around
+- the knob: whole clicks only (bounce and wobble at a detent never count),
+  fast spins and counter wrap-around, the switch's debouncing, press versus
+  hold, and a press already held at start-up
+- the menu engine, against a test menu with every item type: navigation and
+  its limits, nesting depth, editing with keep, cancel and live values,
+  toggles and actions, paging, scrolling, the timeout, and every screen it
+  draws
+- the dashboard's menu: each demo item changes its setting, ECU MODE only
+  once kept, the main screen follows the speed units and shift flash, and
+  the engine data and diagnostics pages show what they should
 
 `tools/rusefi/dash_link.lua` can be checked with Lua 5.4 (`luac5.4 -p`).
 
@@ -397,9 +486,17 @@ src/
     can.h               CAN driver interface (frames, filters, stats)
     can_queue.h         interrupt -> main loop frame queue
     can_stm32.c         FDCAN driver: filters, receive interrupt, TX FIFO, bus-off recovery
+  input/
+    encoder.h           rotary encoder interface (edge count, switch level)
+    encoder_stm32.c     ... on TIM3 in encoder mode, switch on a GPIO
   app/
     dashboard.c         main screen and splash, and which screen to show
     guide.c             pre-start guide screens
+    knob.c/.h           encoder count and switch -> clicks, presses and holds
+    menu.c/.h           menu engine: item tables, navigation, editing, drawing
+    dash_menu.c         the dashboard's menu and its items
+    pages.c             menu pages: engine data, diagnostics
+    settings.c/.h       the driver's settings, edited in the menu
     ui.c/.h             shared palette, fonts and drawing helpers
     dash_data.h         what the screen shows, with validity and link state
     ecu_link.c/.h       CAN pipeline: ECU data -> dash values, dash status -> ECU; its settings
@@ -409,7 +506,7 @@ src/
     logo.c              team logo outline and its polygon fill
 linker/                 STM32G0B1CBTx linker script
 third_party/            CMSIS core 5.9.0 and ST cmsis_device_g0 v1.4.5 (Apache-2.0)
-tests/                  host tests, mock FT812, mock CAN driver, preview dumper
+tests/                  host tests, mock FT812, mock CAN driver, mock encoder, preview dumper
 tools/render_preview.py approximate PNG renderer for command streams
 tools/trace_logo.py     turns logo artwork into the outline table in logo.c
 tools/rusefi/           ECU-side Lua script for the dash status frame
@@ -423,10 +520,14 @@ tools/rusefi/           ECU-side Lua script for the dash status frame
   and `clutch_held`, and set their `DASH_VALID_*` bits; the pre-start guide
   then checks them.
 - **More from the ECU.** Everything rusEFI broadcasts is decoded already
-  (`ecu_link_data()`). Oil pressure, AFR and boost are a matter of screen
-  space.
+  (`ecu_link_data()`). The ENGINE DATA page shows six values without
+  thresholds; warnings for low oil pressure or a lean mixture would need
+  limits that suit the engine.
 - **Dash inputs.** The status frame carries 16 inputs and a mode byte to the
-  ECU, but no buttons are wired yet.
+  ECU. The menu sets the mode; no buttons drive the inputs yet.
+- **Saving settings.** The menu's settings are lost at power-off. Keeping
+  them needs a flash page (the STM32G0 programs flash 64 bits at a time) and
+  a version number on the stored settings.
 - **Throughput.** The SPI driver is polled. A frame is under 2 KB, roughly
   1 ms at 16 MHz, so DMA is a later optimisation and not needed yet.
 - **Not used yet.** Touch (this module has no panel fitted, so the touch

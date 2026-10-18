@@ -54,6 +54,18 @@ void ui_check(int32_t cx, int32_t cy, uint32_t rgb)
     eve_cmd(END());
 }
 
+void ui_degree(int32_t cx, int32_t cy, uint32_t rgb, uint32_t bg)
+{
+    eve_cmd(BEGIN(POINTS));
+    eve_color(rgb);
+    eve_cmd(POINT_SIZE(3 * 16));
+    eve_cmd(VERTEX2F(cx * 16, cy * 16));
+    eve_color(bg);
+    eve_cmd(POINT_SIZE(26));
+    eve_cmd(VERTEX2F(cx * 16, cy * 16));
+    eve_cmd(END());
+}
+
 int32_t ui_spread_x(uint32_t i, uint32_t n, int32_t x0, int32_t x1, int32_t gap)
 {
     return x0 + (int32_t)i * (x1 - x0 + gap) / (int32_t)n;

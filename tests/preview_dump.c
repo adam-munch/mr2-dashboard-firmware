@@ -5,9 +5,14 @@
  */
 #include <stdio.h>
 
+#include "dash_menu.h"
 #include "dashboard.h"
 #include "eve_panels.h"
+#include "menu.h"
+#include "mock_can.h"
+#include "mock_encoder.h"
 #include "mock_eve.h"
+#include "settings.h"
 #include "version.h"
 
 static int dump(const char *dir, const char *name)
@@ -24,6 +29,12 @@ static int dump(const char *dir, const char *name)
     printf("wrote %s (%zu bytes)\n", path, g_mock.fifo_len);
     g_mock.fifo_len = 0;
     return 0;
+}
+
+static void knob(int16_t turn, bool press, uint32_t now_ms)
+{
+    const knob_event_t ev = {turn, press, false};
+    menu_update(&ev, now_ms);
 }
 
 int main(int argc, char **argv)
@@ -96,6 +107,42 @@ int main(int argc, char **argv)
     const dash_data_t power_up = {.valid = 0, .link = DASH_LINK_WAITING};
     dashboard_draw(&power_up, 0);
     err |= dump(dir, "guide_unwired");
+
+    /* The menu, opened while driving: shift lights and rev bar stay. */
+    mock_can_reset();
+    mock_encoder_reset();
+    settings_reset();
+    menu_init(&dash_menu);
+    const dash_data_t drive = {.rpm = 4650, .speed_kph = 112, .coolant_c = 90, .fuel_pct = 58,
+                               .battery_mv = 14200, .gear = 4, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK,
+                               .oil_kpa = 335, .lambda_x1000 = 982, .map_kpa = 64, .intake_c = 31,
+                               .throttle_pct = 22, .timing_deg_x10 = 285};
+    knob(0, true, 0);
+    knob(1, false, 0);
+    dashboard_draw(&drive, 0);
+    err |= dump(dir, "menu");
+
+    /* DISPLAY > BRIGHTNESS, being turned down. */
+    knob(0, true, 0);
+    knob(0, true, 0);
+    knob(-3, false, 0);
+    dashboard_draw(&drive, 0);
+    err |= dump(dir, "menu_brightness");
+    knob(0, true, 0);
+
+    /* The pages. */
+    menu_close();
+    knob(0, true, 0);
+    knob(0, true, 0);
+    dashboard_draw(&drive, 0);
+    err |= dump(dir, "page_engine");
+
+    knob(1, false, 0);
+    g_enc.count = 412;
+    g_can.rx_frames = 30528; /* 12 messages every 50 ms */
+    g_can.tx_len = 25434;
+    dashboard_draw(&drive, 2537000);
+    err |= dump(dir, "page_diagnostics");
 
     return err;
 }
