@@ -46,6 +46,13 @@
 #define PANEL_X 525
 #define PANEL_W 255
 
+/* Warning lamps, between the shift light and the speed */
+#define LAMP_Y0  54
+#define LAMP_Y1  76
+#define LAMP_GAP 8
+
+#define NO_VALUE "--"
+
 /* ---------------------------------------------------------------------------
  * Drawing helpers
  * ------------------------------------------------------------------------ */
@@ -93,8 +100,11 @@ static void tach_vertex(uint32_t angle, int32_t radius)
  * Screen elements
  * ------------------------------------------------------------------------ */
 
-static void draw_tach(uint32_t rpm, uint8_t gear)
+static void draw_tach(const dash_data_t *d)
 {
+    const bool rpm_ok = (d->valid & DASH_VALID_RPM) != 0u;
+    const uint32_t rpm = rpm_ok ? d->rpm : 0u; /* needle rests at 0 without data */
+
     /* Dial face with a rim. */
     eve_cmd(BEGIN(POINTS));
     eve_color(COL_DIAL_RIM);
@@ -139,12 +149,20 @@ static void draw_tach(uint32_t rpm, uint8_t gear)
     eve_cmd_text(TACH_CX, TACH_CY - 80, FONT_SMALL, OPT_CENTER, "x1000 r/min");
 
     /* Digital rpm and gear in the open bottom of the dial. */
-    eve_color(COL_TEXT);
-    eve_cmd_number(TACH_CX, TACH_CY + 85, FONT_LARGE, OPT_CENTER, (int32_t)rpm);
+    if (rpm_ok) {
+        eve_color(COL_TEXT);
+        eve_cmd_number(TACH_CX, TACH_CY + 85, FONT_LARGE, OPT_CENTER, (int32_t)rpm);
+    } else {
+        eve_color(COL_TEXT_DIM);
+        eve_cmd_text(TACH_CX, TACH_CY + 85, FONT_LARGE, OPT_CENTER, NO_VALUE);
+    }
 
-    const char gear_str[2] = {gear == 0u ? 'N' : (char)('0' + gear), '\0'};
+    char gear_str[2] = {'-', '\0'};
+    if ((d->valid & DASH_VALID_GEAR) != 0u && d->gear <= 9u) {
+        gear_str[0] = d->gear == 0u ? 'N' : (char)('0' + d->gear);
+    }
     draw_rect(TACH_CX - 26, TACH_CY + 122, TACH_CX + 26, TACH_CY + 178, COL_TRACK, 6);
-    eve_color(COL_WARN);
+    eve_color(gear_str[0] == '-' ? COL_TEXT_DIM : COL_WARN);
     eve_cmd_text(TACH_CX, TACH_CY + 150, FONT_LARGE, OPT_CENTER, gear_str);
 
     /* Needle with a short tail, then the hub on top. */
@@ -166,21 +184,44 @@ static void draw_tach(uint32_t rpm, uint8_t gear)
     eve_cmd(END());
 }
 
-static void draw_shift_light(uint32_t rpm, uint32_t now_ms)
+static void draw_shift_light(const dash_data_t *d, uint32_t now_ms)
 {
-    const bool lit = rpm >= TACH_SHIFT_RPM && ((now_ms / 100u) & 1u) == 0u; /* 5 Hz flash */
+    const bool lit = (d->valid & DASH_VALID_RPM) != 0u && d->rpm >= TACH_SHIFT_RPM &&
+                     ((now_ms / 100u) & 1u) == 0u; /* 5 Hz flash */
 
     draw_rect(PANEL_X, 18, PANEL_X + PANEL_W, 46, lit ? COL_REDLINE : COL_TRACK, 4);
     eve_color(lit ? COL_TEXT : COL_TEXT_DIM);
     eve_cmd_text(PANEL_X + PANEL_W / 2, 32, FONT_LABEL, OPT_CENTER, "SHIFT");
 }
 
-static void draw_speed(uint32_t speed_kph)
+/* A warning lamp: dark when off, `rgb` when on. */
+static void draw_lamp(int32_t x0, int32_t x1, const char *label, bool on, uint32_t rgb, uint32_t text_rgb)
 {
-    eve_color(COL_TEXT);
-    eve_cmd_number(PANEL_X + PANEL_W / 2, 130, FONT_HUGE, OPT_CENTER, (int32_t)speed_kph);
+    draw_rect(x0, LAMP_Y0, x1, LAMP_Y1, on ? rgb : COL_TRACK, 4);
+    eve_color(on ? text_rgb : COL_TEXT_DIM);
+    eve_cmd_text((int16_t)((x0 + x1) / 2), (LAMP_Y0 + LAMP_Y1) / 2, FONT_SMALL, OPT_CENTER, label);
+}
+
+static void draw_lamps(const dash_data_t *d)
+{
+    const int32_t mid = PANEL_X + PANEL_W / 2;
+    draw_lamp(PANEL_X, mid - LAMP_GAP / 2, "CHECK ENGINE", (d->warnings & DASH_WARN_CHECK_ENGINE) != 0u,
+              COL_WARN, COL_BG_BOTTOM);
+    draw_lamp(mid + LAMP_GAP / 2, PANEL_X + PANEL_W, "LIMITER", (d->warnings & DASH_WARN_LIMITER) != 0u,
+              COL_REDLINE, COL_TEXT);
+}
+
+static void draw_speed(const dash_data_t *d)
+{
+    if ((d->valid & DASH_VALID_SPEED) != 0u) {
+        eve_color(COL_TEXT);
+        eve_cmd_number(PANEL_X + PANEL_W / 2, 140, FONT_HUGE, OPT_CENTER, (int32_t)d->speed_kph);
+    } else {
+        eve_color(COL_TEXT_DIM);
+        eve_cmd_text(PANEL_X + PANEL_W / 2, 140, FONT_HUGE, OPT_CENTER, NO_VALUE);
+    }
     eve_color(COL_TEXT_DIM);
-    eve_cmd_text(PANEL_X + PANEL_W / 2, 200, FONT_MEDIUM, OPT_CENTER, "km/h");
+    eve_cmd_text(PANEL_X + PANEL_W / 2, 206, FONT_MEDIUM, OPT_CENTER, "km/h");
 }
 
 static uint32_t clamp_permille(int32_t value, int32_t lo, int32_t hi)
@@ -211,17 +252,60 @@ static void draw_side_gauges(const dash_data_t *d)
 {
     char value[16];
 
-    snprintf(value, sizeof value, "%d C", d->coolant_c);
-    const uint32_t coolant_rgb = d->coolant_c < 60 ? COL_COLD : (d->coolant_c > 105 ? COL_REDLINE : COL_OK);
-    draw_bar(250, "COOLANT", value, clamp_permille(d->coolant_c, 40, 120), coolant_rgb);
+    if ((d->valid & DASH_VALID_COOLANT) != 0u) {
+        snprintf(value, sizeof value, "%d C", d->coolant_c);
+        const uint32_t rgb = d->coolant_c < 60 ? COL_COLD : (d->coolant_c > 105 ? COL_REDLINE : COL_OK);
+        draw_bar(250, "COOLANT", value, clamp_permille(d->coolant_c, 40, 120), rgb);
+    } else {
+        draw_bar(250, "COOLANT", NO_VALUE, 0u, COL_TRACK);
+    }
 
-    snprintf(value, sizeof value, "%u %%", (unsigned)d->fuel_pct);
-    draw_bar(320, "FUEL", value, clamp_permille(d->fuel_pct, 0, 100), d->fuel_pct < 15u ? COL_WARN : COL_OK);
+    if ((d->valid & DASH_VALID_FUEL) != 0u) {
+        snprintf(value, sizeof value, "%u %%", (unsigned)d->fuel_pct);
+        draw_bar(320, "FUEL", value, clamp_permille(d->fuel_pct, 0, 100), d->fuel_pct < 15u ? COL_WARN : COL_OK);
+    } else {
+        draw_bar(320, "FUEL", NO_VALUE, 0u, COL_TRACK);
+    }
 
-    snprintf(value, sizeof value, "%u.%u V", (unsigned)(d->battery_mv / 1000u),
-             (unsigned)((d->battery_mv % 1000u) / 100u));
-    const bool batt_ok = d->battery_mv >= 12000u && d->battery_mv <= 15000u;
-    draw_bar(390, "BATTERY", value, clamp_permille(d->battery_mv, 10000, 16000), batt_ok ? COL_OK : COL_WARN);
+    if ((d->valid & DASH_VALID_BATTERY) != 0u) {
+        snprintf(value, sizeof value, "%u.%u V", (unsigned)(d->battery_mv / 1000u),
+                 (unsigned)((d->battery_mv % 1000u) / 100u));
+        const bool batt_ok = d->battery_mv >= 12000u && d->battery_mv <= 15000u;
+        draw_bar(390, "BATTERY", value, clamp_permille(d->battery_mv, 10000, 16000), batt_ok ? COL_OK : COL_WARN);
+    } else {
+        draw_bar(390, "BATTERY", NO_VALUE, 0u, COL_TRACK);
+    }
+}
+
+/* Bottom-right corner: where the data comes from, unless all is well. */
+static void draw_status_line(dash_link_t link)
+{
+    const char *text;
+    uint32_t rgb;
+
+    switch (link) {
+    case DASH_LINK_DEMO:
+        text = "DEMO DATA";
+        rgb = COL_TEXT_DIM;
+        break;
+    case DASH_LINK_WAITING:
+        text = "WAITING FOR ECU";
+        rgb = COL_WARN;
+        break;
+    case DASH_LINK_LOST:
+        text = "NO DATA FROM ECU";
+        rgb = COL_REDLINE;
+        break;
+    case DASH_LINK_CAN_FAULT:
+        text = "CAN BUS FAULT";
+        rgb = COL_REDLINE;
+        break;
+    case DASH_LINK_OK:
+    default:
+        return;
+    }
+    eve_color(rgb);
+    eve_cmd_text(SCREEN_W - 12, SCREEN_H - 14, FONT_SMALL, OPT_RIGHTX | OPT_CENTERY, text);
 }
 
 /* ---------------------------------------------------------------------------
@@ -251,7 +335,7 @@ eve_status_t dashboard_draw_splash(const char *fw_version, uint32_t chip_id)
     return eve_cmd_flush();
 }
 
-eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms)
+eve_status_t dashboard_draw(const dash_data_t *d, uint32_t now_ms)
 {
     eve_cmd_dlstart();
     eve_cmd(CLEAR_COLOR_RGB(0, 0, 0));
@@ -259,15 +343,12 @@ eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms)
     eve_cmd_gradient(0, 0, COL_BG_TOP, 0, SCREEN_H, COL_BG_BOTTOM);
     eve_cmd_romfont(FONT_HUGE, FONT_HUGE_ROM);
 
-    draw_tach(d->rpm, d->gear);
-    draw_shift_light(d->rpm, now_ms);
-    draw_speed(d->speed_kph);
+    draw_tach(d);
+    draw_shift_light(d, now_ms);
+    draw_lamps(d);
+    draw_speed(d);
     draw_side_gauges(d);
-
-    if (demo) {
-        eve_color(COL_TEXT_DIM);
-        eve_cmd_text(SCREEN_W - 12, SCREEN_H - 14, FONT_SMALL, OPT_RIGHTX | OPT_CENTERY, "DEMO DATA");
-    }
+    draw_status_line(d->link);
 
     eve_cmd(DISPLAY());
     eve_cmd_swap();
@@ -287,12 +368,13 @@ eve_status_t dashboard_needle_sweep(const dash_data_t *base, uint32_t duration_m
 
         dash_data_t d = *base;
         d.rpm = (uint16_t)(t <= half ? TACH_MAX_RPM * t / half : TACH_MAX_RPM * (2u * half - t) / half);
+        d.valid |= DASH_VALID_RPM;
 
         /* One frame in flight at a time: the co-processor's CMD_DLSTART
          * waits for the previous swap, so this runs at the panel's frame rate. */
         eve_status_t st = eve_cmd_wait_idle(100u);
         if (st == EVE_OK) {
-            st = dashboard_draw(&d, false, start + t);
+            st = dashboard_draw(&d, start + t);
         }
         if (st != EVE_OK || t >= 2u * half) {
             return st;

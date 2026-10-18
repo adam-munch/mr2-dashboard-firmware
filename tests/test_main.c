@@ -1,5 +1,6 @@
 /*
- * Host tests for the EVE driver, the dashboard renderer and helpers.
+ * Host tests for the EVE driver, the CAN pipeline, the dashboard renderer
+ * and helpers.
  * Run: cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
  */
 #include <math.h>
@@ -7,12 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "can_queue.h"
 #include "dashboard.h"
 #include "demo_data.h"
+#include "ecu_link.h"
 #include "eve.h"
 #include "eve_panels.h"
 #include "fixmath.h"
+#include "mock_can.h"
 #include "mock_eve.h"
+#include "rusefi_can.h"
 
 static int s_failures;
 static int s_checks;
@@ -41,6 +46,7 @@ static int s_checks;
     do {                             \
         printf("%s\n", #test);       \
         mock_eve_reset();            \
+        mock_can_reset();            \
         test();                      \
     } while (0)
 
@@ -456,27 +462,90 @@ static void test_render_splash(void)
     check_frame("splash");
 }
 
+/* True if the captured stream draws the string `s` with CMD_TEXT. */
+static bool stream_has_text(const char *s)
+{
+    const size_t n = mock_fifo_words();
+    for (size_t i = 0; i + 3 < n; i++) {
+        if (mock_fifo_word(i) == CMD_TEXT && strcmp((const char *)&g_mock.fifo[(i + 3) * 4], s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void test_render_dashboard(void)
 {
     static const dash_data_t cases[] = {
-        {.rpm = 0, .speed_kph = 0, .coolant_c = -20, .fuel_pct = 0, .battery_mv = 0, .gear = 0},
-        {.rpm = 3456, .speed_kph = 88, .coolant_c = 90, .fuel_pct = 55, .battery_mv = 14100, .gear = 3},
-        {.rpm = 8000, .speed_kph = 240, .coolant_c = 125, .fuel_pct = 100, .battery_mv = 16500, .gear = 5},
-        {.rpm = 9999, .speed_kph = 999, .coolant_c = 999, .fuel_pct = 255, .battery_mv = 65535, .gear = 5},
+        {.rpm = 0, .speed_kph = 0, .coolant_c = -20, .fuel_pct = 0, .battery_mv = 0, .gear = 0,
+         .valid = DASH_VALID_ALL},
+        {.rpm = 3456, .speed_kph = 88, .coolant_c = 90, .fuel_pct = 55, .battery_mv = 14100, .gear = 3,
+         .valid = DASH_VALID_ALL, .link = DASH_LINK_DEMO},
+        {.rpm = 8000, .speed_kph = 240, .coolant_c = 125, .fuel_pct = 100, .battery_mv = 16500, .gear = 5,
+         .valid = DASH_VALID_ALL, .warnings = DASH_WARN_CHECK_ENGINE | DASH_WARN_LIMITER},
+        {.rpm = 9999, .speed_kph = 999, .coolant_c = 999, .fuel_pct = 255, .battery_mv = 65535, .gear = 9,
+         .valid = DASH_VALID_ALL, .warnings = 0xFF},
+        {.rpm = 9999, .gear = 200, .valid = DASH_VALID_ALL}, /* out-of-range gear */
+        {.rpm = 5000, .valid = 0, .link = DASH_LINK_WAITING},
+        {.rpm = 5000, .valid = DASH_VALID_RPM, .link = DASH_LINK_LOST},
+        {.valid = 0, .link = DASH_LINK_CAN_FAULT},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         init_ok();
-        CHECK_EQ(dashboard_draw(&cases[i], true, 1234), EVE_OK);
+        CHECK_EQ(dashboard_draw(&cases[i], 1234), EVE_OK);
         char name[32];
         snprintf(name, sizeof name, "dashboard #%zu", i);
         check_frame(name);
     }
 }
 
+static void test_render_validity_and_status(void)
+{
+    /* Everything valid and the link up: no "--" and no status line. */
+    dash_data_t d = {.rpm = 3000, .speed_kph = 80, .coolant_c = 85, .fuel_pct = 50, .battery_mv = 14000,
+                     .gear = 0, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK};
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK(!stream_has_text("--"));
+    CHECK(stream_has_text("N"));
+    CHECK(stream_has_text("CHECK ENGINE"));
+    CHECK(stream_has_text("LIMITER"));
+    CHECK(!stream_has_text("DEMO DATA"));
+    CHECK(!stream_has_text("WAITING FOR ECU"));
+    CHECK(!stream_has_text("NO DATA FROM ECU"));
+
+    /* Nothing valid: every value is "--", gear is "-". */
+    d.valid = 0;
+    d.link = DASH_LINK_WAITING;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK(stream_has_text("--"));
+    CHECK(stream_has_text("-"));
+    CHECK(!stream_has_text("N"));
+    CHECK(stream_has_text("WAITING FOR ECU"));
+
+    static const struct {
+        dash_link_t link;
+        const char *text;
+    } lines[] = {
+        {DASH_LINK_DEMO, "DEMO DATA"},
+        {DASH_LINK_WAITING, "WAITING FOR ECU"},
+        {DASH_LINK_LOST, "NO DATA FROM ECU"},
+        {DASH_LINK_CAN_FAULT, "CAN BUS FAULT"},
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof lines[0]; i++) {
+        d.link = lines[i].link;
+        init_ok();
+        CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+        CHECK(stream_has_text(lines[i].text));
+    }
+}
+
 static void test_needle_sweep(void)
 {
     init_ok();
-    const dash_data_t base = {.rpm = 0, .speed_kph = 0, .coolant_c = 25, .fuel_pct = 50, .battery_mv = 12600};
+    const dash_data_t base = {.rpm = 0, .speed_kph = 0, .coolant_c = 25, .fuel_pct = 50, .battery_mv = 12600,
+                              .link = DASH_LINK_WAITING};
     CHECK_EQ(dashboard_needle_sweep(&base, 300), EVE_OK);
     CHECK(mock_fifo_words() > 0);
 }
@@ -527,6 +596,570 @@ static void test_demo_data(void)
     CHECK(max_rpm >= 6500);
     CHECK(max_speed >= 150);
     CHECK_EQ(d.coolant_c >= 88, 1); /* warmed up */
+    CHECK_EQ(d.valid, DASH_VALID_ALL);
+    CHECK_EQ(d.link, DASH_LINK_DEMO);
+}
+
+/* ---------------------------------------------------------------------------
+ * CAN: receive queue
+ * ------------------------------------------------------------------------ */
+
+static void test_can_queue(void)
+{
+    static can_queue_t q;
+    can_queue_init(&q);
+    can_frame_t f = {0};
+    can_frame_t out;
+
+    CHECK(!can_queue_pop(&q, &out));
+    for (uint32_t i = 0; i < CAN_QUEUE_LEN; i++) {
+        f.id = i;
+        CHECK(can_queue_push(&q, &f));
+    }
+    f.id = 999;
+    CHECK(!can_queue_push(&q, &f)); /* full: newest is dropped */
+    for (uint32_t i = 0; i < CAN_QUEUE_LEN; i++) {
+        CHECK(can_queue_pop(&q, &out));
+        CHECK_EQ(out.id, i);
+    }
+    CHECK(!can_queue_pop(&q, &out));
+
+    /* Many laps around the ring, in order, with the queue partly full. */
+    bool ok = true;
+    uint32_t next_in = 0;
+    uint32_t next_out = 0;
+    for (uint32_t round = 0; round < 1000; round++) {
+        for (uint32_t k = 0; k < 1 + round % 7; k++) {
+            f.id = next_in;
+            if (can_queue_push(&q, &f)) {
+                next_in++;
+            }
+        }
+        for (uint32_t k = 0; k < 1 + round % 5; k++) {
+            if (can_queue_pop(&q, &out)) {
+                ok = ok && out.id == next_out;
+                next_out++;
+            }
+        }
+    }
+    CHECK(ok);
+    CHECK(next_in > 3 * CAN_QUEUE_LEN);
+
+    /* Unsigned indices wrap cleanly. */
+    q.head = q.tail = 0xFFFFFFFEu;
+    for (uint32_t i = 0; i < 4; i++) {
+        f.id = i;
+        CHECK(can_queue_push(&q, &f));
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        CHECK(can_queue_pop(&q, &out));
+        CHECK_EQ(out.id, i);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * CAN: rusEFI broadcast decoder
+ *
+ * Frames are built from the signal definitions in rusEFI_CAN_verbose.dbc
+ * (start bit, length, scale, offset; all Intel byte order), not from the
+ * decoder's byte offsets, so the two are checked against each other.
+ * ------------------------------------------------------------------------ */
+
+static can_frame_t rusefi_frame(uint32_t base, uint32_t offset, uint32_t time_ms)
+{
+    can_frame_t f;
+    memset(&f, 0, sizeof f);
+    f.id = base + offset;
+    f.dlc = 8;
+    f.time_ms = time_ms;
+    return f;
+}
+
+/* Place a raw DBC signal value: Intel (little-endian) bit numbering. */
+static void dbc_put(can_frame_t *f, unsigned start, unsigned len, int32_t raw)
+{
+    for (unsigned i = 0; i < len; i++) {
+        if ((((uint32_t)raw) >> i) & 1u) {
+            const unsigned bit = start + i;
+            f->data[bit / 8] |= (uint8_t)(1u << (bit % 8));
+        }
+    }
+}
+
+/* Physical value -> raw, as a DBC tool would: raw = (phys - offset) / scale. */
+static int32_t dbc_raw(double phys, double scale, double offset)
+{
+    return (int32_t)lround((phys - offset) / scale);
+}
+
+/* One full broadcast at `base`, all 12 messages, with distinctive values. */
+static size_t make_broadcast(can_frame_t *out, uint32_t base, uint32_t time_ms)
+{
+    can_frame_t *f = out;
+
+    *f = rusefi_frame(base, 0, time_ms); /* BASE0 */
+    dbc_put(f, 0, 16, 3);                /* WarningCounter */
+    dbc_put(f, 16, 16, 0x1234);          /* LastError */
+    dbc_put(f, 32, 1, 1);                /* RevLimAct */
+    dbc_put(f, 33, 1, 1);                /* MainRelayAct */
+    dbc_put(f, 34, 1, 0);                /* FuelPumpAct */
+    dbc_put(f, 35, 1, 1);                /* CELAct */
+    dbc_put(f, 36, 1, 0);                /* EGOHeatAct */
+    dbc_put(f, 37, 1, 1);                /* LambdaProtectAct */
+    dbc_put(f, 38, 1, 1);                /* Fan */
+    dbc_put(f, 39, 1, 0);                /* Fan2 */
+    dbc_put(f, 40, 8, 3);                /* CurrentGear */
+    dbc_put(f, 48, 16, dbc_raw(1234.5, 0.1, 0)); /* DistanceTraveled, km */
+    f++;
+
+    *f = rusefi_frame(base, 1, time_ms); /* BASE1 */
+    dbc_put(f, 0, 16, 3456);                      /* RPM */
+    dbc_put(f, 16, 16, dbc_raw(-5.5, 0.02, 0));   /* IgnitionTiming, signed */
+    dbc_put(f, 32, 8, dbc_raw(37.5, 0.5, 0));     /* InjDuty */
+    dbc_put(f, 40, 8, dbc_raw(12.0, 0.5, 0));     /* IgnDuty */
+    dbc_put(f, 48, 8, 97);                        /* VehicleSpeed */
+    dbc_put(f, 56, 8, 85);                        /* FlexPct */
+    f++;
+
+    *f = rusefi_frame(base, 2, time_ms); /* BASE2 */
+    dbc_put(f, 0, 16, dbc_raw(45.67, 0.01, 0));   /* PPS */
+    dbc_put(f, 16, 16, dbc_raw(44.10, 0.01, 0));  /* TPS1 */
+    dbc_put(f, 32, 16, dbc_raw(-1.0, 0.01, 0));   /* TPS2: no sensor */
+    dbc_put(f, 48, 16, dbc_raw(0.0, 0.01, 0));    /* Wastegate */
+    f++;
+
+    *f = rusefi_frame(base, 3, time_ms); /* BASE3 */
+    dbc_put(f, 0, 16, dbc_raw(101.3, 1.0 / 30, 0)); /* MAP */
+    dbc_put(f, 16, 8, dbc_raw(88, 1, -40));         /* CoolantTemp */
+    dbc_put(f, 24, 8, dbc_raw(-10, 1, -40));        /* IntakeTemp */
+    dbc_put(f, 32, 8, dbc_raw(0, 1, -40));          /* AUX1Temp */
+    dbc_put(f, 40, 8, dbc_raw(150, 1, -40));        /* AUX2Temp */
+    dbc_put(f, 48, 8, dbc_raw(45, 1, -40));         /* MCUTemp */
+    dbc_put(f, 56, 8, dbc_raw(62.5, 0.5, 0));       /* FuelLevel */
+    f++;
+
+    *f = rusefi_frame(base, 4, time_ms); /* BASE4 */
+    dbc_put(f, 16, 16, dbc_raw(350, 1.0 / 30, 0)); /* OilPress */
+    dbc_put(f, 32, 8, dbc_raw(95, 1, -40));        /* OilTemperature */
+    dbc_put(f, 40, 8, dbc_raw(30, 1, -40));        /* FuelTemperature */
+    dbc_put(f, 48, 16, dbc_raw(13.85, 0.001, 0));  /* BattVolt */
+    f++;
+
+    *f = rusefi_frame(base, 5, time_ms); /* BASE5 */
+    dbc_put(f, 0, 16, 412);                         /* CylAM, mg */
+    dbc_put(f, 16, 16, dbc_raw(123.45, 0.01, 0));   /* EstMAF */
+    dbc_put(f, 32, 16, dbc_raw(4.5, 1.0 / 300, 0)); /* InjPW */
+    dbc_put(f, 48, 16, 7);                          /* KnockCt */
+    f++;
+
+    *f = rusefi_frame(base, 6, time_ms); /* BASE6 */
+    dbc_put(f, 0, 16, 2500);                       /* FuelUsed */
+    dbc_put(f, 16, 16, dbc_raw(1.5, 0.005, 0));    /* FuelFlow */
+    dbc_put(f, 32, 16, dbc_raw(-3.25, 0.01, 0));   /* FuelTrim1, signed */
+    dbc_put(f, 48, 16, dbc_raw(2.0, 0.01, 0));     /* FuelTrim2 */
+    f++;
+
+    *f = rusefi_frame(base, 7, time_ms); /* BASE7 */
+    dbc_put(f, 0, 16, dbc_raw(0.85, 0.0001, 0));    /* Lam1 */
+    dbc_put(f, 16, 16, dbc_raw(1.0, 0.0001, 0));    /* Lam2 */
+    dbc_put(f, 32, 16, dbc_raw(300, 1.0 / 30, 0));  /* FpLow */
+    dbc_put(f, 48, 16, dbc_raw(120.5, 0.1, 0));     /* FpHigh */
+    f++;
+
+    *f = rusefi_frame(base, 8, time_ms); /* BASE8, all signed */
+    const int32_t cams[8] = {25, 30, -10, -12, 5, 6, -7, -8};
+    for (unsigned i = 0; i < 8; i++) {
+        dbc_put(f, 8 * i, 8, cams[i]);
+    }
+    f++;
+
+    *f = rusefi_frame(base, 9, time_ms); /* BASE9 */
+    dbc_put(f, 0, 8, dbc_raw(850, 5, 0)); /* Egt1 */
+    dbc_put(f, 8, 8, dbc_raw(845, 5, 0)); /* Egt2 */
+    f++;
+
+    *f = rusefi_frame(base, 10, time_ms); /* BASE10 */
+    dbc_put(f, 0, 8, -40); /* knock0 */
+    dbc_put(f, 24, 8, 3);  /* knock3 */
+    f++;
+
+    *f = rusefi_frame(base, 11, time_ms); /* BASE11, 1 byte */
+    f->dlc = 1;
+    dbc_put(f, 0, 1, 1); /* BrakePedal */
+    f++;
+
+    return (size_t)(f - out);
+}
+
+static void check_broadcast_values(const rusefi_data_t *d)
+{
+    CHECK_EQ(d->warning_count, 3);
+    CHECK_EQ(d->last_error, 0x1234);
+    CHECK_EQ(d->flags, RUSEFI_FLAG_FUEL_SPARK_CUT | RUSEFI_FLAG_MAIN_RELAY | RUSEFI_FLAG_CHECK_ENGINE |
+                           RUSEFI_FLAG_LAMBDA_PROTECT | RUSEFI_FLAG_FAN);
+    CHECK_EQ(d->gear, 3);
+    CHECK_EQ(d->distance_km_x10, 12345);
+
+    CHECK_EQ(d->rpm, 3456);
+    CHECK(d->timing_deg_x50 == -275);
+    CHECK_EQ(d->inj_duty_pct_x2, 75);
+    CHECK_EQ(d->coil_duty_pct_x2, 24);
+    CHECK_EQ(d->speed_kph, 97);
+    CHECK_EQ(d->ethanol_pct, 85);
+
+    CHECK(d->pedal_pct_x100 == 4567);
+    CHECK(d->tps1_pct_x100 == 4410);
+    CHECK(d->tps2_pct_x100 == RUSEFI_PCT_NO_SENSOR);
+    CHECK(d->wastegate_pct_x100 == 0);
+
+    CHECK_EQ(d->map_kpa_x30, 3039);
+    CHECK(d->coolant_c == 88);
+    CHECK(d->intake_c == -10);
+    CHECK(d->aux1_c == 0);
+    CHECK(d->aux2_c == 150);
+    CHECK(d->mcu_c == 45);
+    CHECK_EQ(d->fuel_level_pct_x2, 125);
+
+    CHECK_EQ(d->oil_press_kpa_x30, 10500);
+    CHECK(d->oil_temp_c == 95);
+    CHECK(d->fuel_temp_c == 30);
+    CHECK_EQ(d->battery_mv, 13850);
+
+    CHECK_EQ(d->cyl_airmass_mg, 412);
+    CHECK_EQ(d->airflow_kgh_x100, 12345);
+    CHECK_EQ(d->inj_pulse_ms_x300, 1350);
+    CHECK_EQ(d->knock_count, 7);
+
+    CHECK_EQ(d->fuel_used_g, 2500);
+    CHECK_EQ(d->fuel_flow_gps_x200, 300);
+    CHECK(d->fuel_trim_pct_x100[0] == -325);
+    CHECK(d->fuel_trim_pct_x100[1] == 200);
+
+    CHECK_EQ(d->lambda_x10000[0], 8500);
+    CHECK_EQ(d->lambda_x10000[1], 10000);
+    CHECK_EQ(d->fuel_press_low_kpa_x30, 9000);
+    CHECK_EQ(d->fuel_press_high_bar_x10, 1205);
+
+    const int8_t cams[8] = {25, 30, -10, -12, 5, 6, -7, -8};
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(d->cam_deg[i] == cams[i]);
+    }
+
+    CHECK_EQ(d->egt_c[0], 850);
+    CHECK_EQ(d->egt_c[1], 845);
+    CHECK_EQ(d->egt_c[2], 0);
+
+    CHECK(d->knock_db[0] == -40);
+    CHECK(d->knock_db[3] == 3);
+
+    CHECK(d->brake_pedal);
+}
+
+static void test_rusefi_decode(void)
+{
+    can_frame_t frames[RUSEFI_MSG_COUNT];
+    const size_t n = make_broadcast(frames, RUSEFI_DEFAULT_BASE_ID, 1000);
+    CHECK_EQ(n, RUSEFI_MSG_COUNT);
+
+    rusefi_data_t d;
+    rusefi_init(&d);
+    for (size_t i = 0; i < n; i++) {
+        CHECK(rusefi_decode(&d, RUSEFI_DEFAULT_BASE_ID, false, &frames[i]));
+    }
+    check_broadcast_values(&d);
+    CHECK_EQ(d.seen, (1u << RUSEFI_MSG_COUNT) - 1u);
+    CHECK_EQ(d.frames, RUSEFI_MSG_COUNT);
+    CHECK_EQ(d.last_rx_ms, 1000);
+
+    /* Freshness: timeout boundary, never-seen messages, a frame stamped
+     * just after `now` was read. */
+    CHECK(rusefi_fresh(&d, RUSEFI_MSG_SPEEDS, 1000 + 499, 500));
+    CHECK(!rusefi_fresh(&d, RUSEFI_MSG_SPEEDS, 1000 + 500, 500));
+    CHECK(rusefi_fresh(&d, RUSEFI_MSG_SPEEDS, 999, 500));
+    rusefi_data_t empty;
+    rusefi_init(&empty);
+    CHECK(!rusefi_fresh(&empty, RUSEFI_MSG_SPEEDS, 0, 500));
+}
+
+static void test_rusefi_rejects(void)
+{
+    rusefi_data_t d;
+    rusefi_init(&d);
+
+    can_frame_t f = rusefi_frame(RUSEFI_DEFAULT_BASE_ID, 1, 0);
+    dbc_put(&f, 0, 16, 5000);
+
+    can_frame_t bad = f;
+    bad.id = RUSEFI_DEFAULT_BASE_ID - 1u; /* below the range */
+    CHECK(!rusefi_decode(&d, RUSEFI_DEFAULT_BASE_ID, false, &bad));
+    bad.id = RUSEFI_DEFAULT_BASE_ID + RUSEFI_MSG_COUNT; /* above it */
+    CHECK(!rusefi_decode(&d, RUSEFI_DEFAULT_BASE_ID, false, &bad));
+    bad = f;
+    bad.ext = true; /* same number, but a 29-bit ID */
+    CHECK(!rusefi_decode(&d, RUSEFI_DEFAULT_BASE_ID, false, &bad));
+    bad = f;
+    bad.dlc = 7; /* truncated */
+    CHECK(!rusefi_decode(&d, RUSEFI_DEFAULT_BASE_ID, false, &bad));
+    CHECK_EQ(d.seen, 0);
+    CHECK_EQ(d.rpm, 0);
+
+    /* A custom base address with 29-bit IDs. */
+    const uint32_t base = 0x1F00000u;
+    can_frame_t frames[RUSEFI_MSG_COUNT];
+    const size_t n = make_broadcast(frames, base, 5);
+    for (size_t i = 0; i < n; i++) {
+        frames[i].ext = true;
+        CHECK(!rusefi_decode(&d, base, false, &frames[i]));
+        CHECK(rusefi_decode(&d, base, true, &frames[i]));
+    }
+    check_broadcast_values(&d);
+}
+
+/* ---------------------------------------------------------------------------
+ * CAN: ECU link (decode -> dash values, dash status frame -> ECU)
+ * ------------------------------------------------------------------------ */
+
+static void inject_broadcast(uint32_t time_ms)
+{
+    can_frame_t frames[RUSEFI_MSG_COUNT];
+    const size_t n = make_broadcast(frames, ECU_RUSEFI_BASE_ID, time_ms);
+    for (size_t i = 0; i < n; i++) {
+        mock_can_inject(&frames[i]);
+    }
+}
+
+static void inject_rpm(uint16_t rpm, uint32_t time_ms)
+{
+    can_frame_t f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_SPEEDS, time_ms);
+    dbc_put(&f, 0, 16, rpm);
+    mock_can_inject(&f);
+}
+
+static void test_ecu_link_pipeline(void)
+{
+    dash_data_t d;
+
+    CHECK(ecu_link_init(0));
+    CHECK(g_can.init_called);
+    CHECK_EQ(g_can.bitrate, 500000);
+    CHECK_EQ(g_can.n_filters, 1);
+    CHECK_EQ(g_can.filters[0].first, 0x200);
+    CHECK_EQ(g_can.filters[0].last, 0x20B);
+    CHECK(!g_can.filters[0].ext);
+
+    ecu_link_poll(0);
+    ecu_link_get_dash(&d, 0);
+    CHECK_EQ(d.link, DASH_LINK_WAITING);
+    CHECK_EQ(d.valid, 0);
+
+    /* A full broadcast: every dash value from the right message. */
+    inject_broadcast(100);
+    ecu_link_poll(101);
+    ecu_link_get_dash(&d, 110);
+    CHECK_EQ(d.link, DASH_LINK_OK);
+    CHECK_EQ(d.valid, DASH_VALID_ALL);
+    CHECK_EQ(d.rpm, 3456); /* first value: no smoothing from nothing */
+    CHECK_EQ(d.speed_kph, 97);
+    CHECK(d.coolant_c == 88);
+    CHECK_EQ(d.fuel_pct, 63); /* 62.5 % rounds up */
+    CHECK_EQ(d.battery_mv, 13850);
+    CHECK_EQ(d.gear, 3);
+    CHECK_EQ(d.warnings, DASH_WARN_CHECK_ENGINE | DASH_WARN_LIMITER);
+    CHECK_EQ(ecu_link_data()->map_kpa_x30, 3039); /* the full decode is available too */
+
+    /* Values expire together with their message; then the link is lost. */
+    ecu_link_get_dash(&d, 100 + ECU_DATA_TIMEOUT_MS - 1);
+    CHECK_EQ(d.valid, DASH_VALID_ALL);
+    ecu_link_get_dash(&d, 100 + ECU_DATA_TIMEOUT_MS);
+    CHECK_EQ(d.valid, 0);
+    CHECK_EQ(d.warnings, 0);
+    CHECK_EQ(d.link, DASH_LINK_LOST);
+
+    /* Only rpm/speed arrive: only those are valid, but the link is up. */
+    inject_rpm(2000, 3000);
+    ecu_link_poll(3000);
+    ecu_link_get_dash(&d, 3000);
+    CHECK_EQ(d.link, DASH_LINK_OK);
+    CHECK_EQ(d.valid, DASH_VALID_RPM | DASH_VALID_SPEED);
+    CHECK_EQ(d.rpm, 2000);
+
+    /* A gear the screen can't show is dropped, not drawn as garbage. */
+    can_frame_t st = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_STATUS, 3000);
+    dbc_put(&st, 40, 8, 12);
+    mock_can_inject(&st);
+    ecu_link_poll(3000);
+    ecu_link_get_dash(&d, 3000);
+    CHECK_EQ(d.valid & DASH_VALID_GEAR, 0);
+
+    /* Bus off overrides everything. */
+    g_can.state = CAN_STATE_BUS_OFF;
+    ecu_link_get_dash(&d, 3000);
+    CHECK_EQ(d.link, DASH_LINK_CAN_FAULT);
+    g_can.state = CAN_STATE_PASSIVE; /* passive alone isn't a fault: e.g. we're the only node acking */
+    ecu_link_get_dash(&d, 3000);
+    CHECK_EQ(d.link, DASH_LINK_OK);
+}
+
+static void test_ecu_link_timestamps(void)
+{
+    dash_data_t d;
+    CHECK(ecu_link_init(0));
+
+    /* Frames that sat in the queue past the timeout don't count as live. */
+    inject_broadcast(0);
+    ecu_link_poll(5000);
+    ecu_link_get_dash(&d, 5000);
+    CHECK_EQ(d.valid, 0);
+    CHECK_EQ(d.link, DASH_LINK_LOST);
+
+    /* A frame stamped just after the main loop read the time is fresh. */
+    inject_broadcast(6001);
+    ecu_link_poll(6000);
+    ecu_link_get_dash(&d, 6000);
+    CHECK_EQ(d.valid, DASH_VALID_ALL);
+    CHECK_EQ(d.link, DASH_LINK_OK);
+}
+
+static void test_ecu_link_ignores_other_traffic(void)
+{
+    dash_data_t d;
+    CHECK(ecu_link_init(0));
+
+    can_frame_t f = rusefi_frame(0, 0x1FF, 10);
+    mock_can_inject(&f);
+    f.id = 0x20C;
+    mock_can_inject(&f);
+    f.id = 0x201;
+    f.ext = true;
+    mock_can_inject(&f);
+    ecu_link_poll(10);
+    ecu_link_get_dash(&d, 10);
+    CHECK_EQ(d.link, DASH_LINK_WAITING);
+    CHECK_EQ(d.valid, 0);
+}
+
+static void test_ecu_link_can_init_fails(void)
+{
+    dash_data_t d;
+    g_can.init_ok = false;
+    CHECK(!ecu_link_init(0));
+    for (uint32_t t = 0; t <= 1000; t += 10) {
+        ecu_link_poll(t);
+    }
+    ecu_link_get_dash(&d, 1000);
+    CHECK_EQ(d.link, DASH_LINK_CAN_FAULT);
+    CHECK_EQ(g_can.tx_len, 0); /* nothing sent through a dead controller */
+}
+
+static void test_ecu_link_rpm_smoothing(void)
+{
+    dash_data_t d;
+    CHECK(ecu_link_init(0));
+
+    inject_rpm(1000, 0);
+    ecu_link_poll(0);
+    ecu_link_get_dash(&d, 0);
+    CHECK_EQ(d.rpm, 1000);
+
+    /* Step to 3000: the needle moves there over a few frames, without
+     * jumping or overshooting, and lands exactly. */
+    inject_rpm(3000, 16);
+    ecu_link_poll(16);
+    uint16_t prev = 1000;
+    bool monotonic = true;
+    uint32_t settled_at = 0;
+    for (uint32_t t = 16; t <= 400; t += 16) {
+        if (t % 48 == 16) { /* the ECU repeats itself every ~50 ms */
+            inject_rpm(3000, t);
+            ecu_link_poll(t);
+        }
+        ecu_link_get_dash(&d, t);
+        if (t == 16) {
+            CHECK(d.rpm > 1000 && d.rpm < 3000);
+        }
+        monotonic = monotonic && d.rpm >= prev && d.rpm <= 3000;
+        prev = d.rpm;
+        if (settled_at == 0 && d.rpm == 3000) {
+            settled_at = t;
+        }
+    }
+    CHECK(monotonic);
+    CHECK_EQ(d.rpm, 3000);
+    CHECK(settled_at > 16 && settled_at <= 400);
+
+    /* After the data drops out, the next value is shown as-is. */
+    ecu_link_get_dash(&d, 400 + ECU_DATA_TIMEOUT_MS);
+    CHECK_EQ(d.valid & DASH_VALID_RPM, 0);
+    inject_rpm(800, 2000);
+    ecu_link_poll(2000);
+    ecu_link_get_dash(&d, 2000);
+    CHECK_EQ(d.rpm, 800);
+}
+
+static void test_ecu_link_tx(void)
+{
+    CHECK(ecu_link_init(0));
+
+    /* Announces itself straight away. */
+    ecu_link_poll(0);
+    CHECK_EQ(g_can.tx_len, 1);
+    const can_frame_t *f = &g_can.tx[0];
+    CHECK_EQ(f->id, DASH_TX_ID);
+    CHECK(!f->ext);
+    CHECK_EQ(f->dlc, 8);
+    const uint8_t first[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(memcmp(f->data, first, 8) == 0);
+
+    /* Then every DASH_TX_PERIOD_MS, counting up. */
+    ecu_link_poll(50);
+    CHECK_EQ(g_can.tx_len, 1);
+    ecu_link_poll(DASH_TX_PERIOD_MS);
+    CHECK_EQ(g_can.tx_len, 2);
+    CHECK_EQ(g_can.tx[1].data[0], 1);
+
+    /* A change goes out right away (after a short minimum gap). */
+    ecu_link_set_display_ok(true);
+    ecu_link_poll(DASH_TX_PERIOD_MS + 5);
+    CHECK_EQ(g_can.tx_len, 2);
+    ecu_link_poll(DASH_TX_PERIOD_MS + 10);
+    CHECK_EQ(g_can.tx_len, 3);
+    CHECK_EQ(g_can.tx[2].data[0], 2);
+    CHECK_EQ(g_can.tx[2].data[1], DASH_STATUS_DISPLAY_OK);
+
+    ecu_link_set_inputs(0x0102);
+    ecu_link_set_mode(7);
+    ecu_link_set_mode(7); /* no change, no extra frame */
+    ecu_link_poll(DASH_TX_PERIOD_MS + 20);
+    CHECK_EQ(g_can.tx_len, 4);
+    const uint8_t want[8] = {3, DASH_STATUS_DISPLAY_OK, 0x02, 0x01, 7, 0, 0, 0};
+    CHECK(memcmp(g_can.tx[3].data, want, 8) == 0);
+
+    /* Once ECU data flows, the frame says so. */
+    inject_broadcast(150);
+    ecu_link_poll(150);
+    ecu_link_poll(DASH_TX_PERIOD_MS + 20 + DASH_TX_PERIOD_MS);
+    CHECK_EQ(g_can.tx_len, 5);
+    CHECK_EQ(g_can.tx[4].data[1], DASH_STATUS_DISPLAY_OK | DASH_STATUS_ECU_DATA_OK);
+
+    /* TX FIFO full (nobody acking): no retry storm, the counter only counts
+     * frames that were queued. */
+    g_can.tx_full = true;
+    const uint32_t t0 = 1000;
+    for (uint32_t t = t0; t < t0 + 1000; t++) {
+        ecu_link_poll(t);
+    }
+    CHECK(g_can.tx_dropped >= 9 && g_can.tx_dropped <= 11);
+    g_can.tx_full = false;
+    ecu_link_poll(t0 + 1000);
+    CHECK_EQ(g_can.tx_len, 6);
+    CHECK_EQ(g_can.tx[5].data[0], 5);
+
+    /* Steady state: 10 frames a second, no more. */
+    const size_t before = g_can.tx_len;
+    for (uint32_t t = 3000; t < 4000; t++) {
+        ecu_link_poll(t);
+    }
+    CHECK_EQ(g_can.tx_len - before, 1000 / DASH_TX_PERIOD_MS);
 }
 
 int main(void)
@@ -546,9 +1179,19 @@ int main(void)
     RUN(test_deferred_error);
     RUN(test_render_splash);
     RUN(test_render_dashboard);
+    RUN(test_render_validity_and_status);
     RUN(test_needle_sweep);
     RUN(test_fixmath);
     RUN(test_demo_data);
+    RUN(test_can_queue);
+    RUN(test_rusefi_decode);
+    RUN(test_rusefi_rejects);
+    RUN(test_ecu_link_pipeline);
+    RUN(test_ecu_link_timestamps);
+    RUN(test_ecu_link_ignores_other_traffic);
+    RUN(test_ecu_link_can_init_fails);
+    RUN(test_ecu_link_rpm_smoothing);
+    RUN(test_ecu_link_tx);
 
     printf("\n%d checks, %d failures\n", s_checks, s_failures);
     return s_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

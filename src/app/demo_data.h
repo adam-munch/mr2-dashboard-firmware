@@ -1,6 +1,6 @@
 /*
  * Simulated engine data so the dashboard can be exercised without a car.
- * Replace with real inputs (CAN, ADC, pulse capture) when they exist.
+ * Used instead of the ECU's data when built with DASH_DEMO_DATA=1.
  */
 #ifndef DEMO_DATA_H
 #define DEMO_DATA_H
