@@ -20,10 +20,13 @@ eve_status_t dashboard_draw_splash(const char *fw_version, uint32_t chip_id, uin
  * `duration_ms`. */
 eve_status_t dashboard_rev_sweep(const dash_data_t *base, uint32_t duration_ms);
 
-/* Draw one frame. While the engine is waiting to be started this is the
- * pre-start guide (e-stop, steering wheel, start button; see guide.h),
- * otherwise the main screen. Values not flagged in d->valid are drawn as
- * "--"; d->link picks the status line. `now_ms` drives flashing and animation. */
+/* Draw one frame. While the menu is open (menu.h) this is the menu, under
+ * the shift lights and rev bar. Otherwise, while the engine is waiting to be
+ * started, the pre-start guide (e-stop, steering wheel, start button; see
+ * guide.h), else the main screen. Values not flagged in d->valid are drawn
+ * as "--"; d->link picks the status line; the speed units and shift-light
+ * flash follow g_settings (settings.h). `now_ms` drives flashing and
+ * animation. */
 eve_status_t dashboard_draw(const dash_data_t *d, uint32_t now_ms);
 
 #endif /* DASHBOARD_H */

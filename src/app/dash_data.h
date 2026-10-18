@@ -13,7 +13,6 @@
 #define DASH_VALID_FUEL    (1u << 3)
 #define DASH_VALID_BATTERY (1u << 4)
 #define DASH_VALID_GEAR    (1u << 5)
-#define DASH_VALID_ALL     0x3Fu /* all of the above: everything the ECU sends */
 
 /* The start-procedure inputs (see guide.h). They don't come from the ECU, so
  * set these once the e-stop, steering-wheel detect and clutch switch are
@@ -22,6 +21,18 @@
 #define DASH_VALID_WHEEL   (1u << 7)
 #define DASH_VALID_CLUTCH  (1u << 8)
 #define DASH_VALID_INPUTS  (DASH_VALID_ESTOP | DASH_VALID_WHEEL | DASH_VALID_CLUTCH)
+
+/* The engine data page (pages.h). Each needs its sensor fitted on the ECU. */
+#define DASH_VALID_OIL_PRESS (1u << 9)
+#define DASH_VALID_LAMBDA    (1u << 10)
+#define DASH_VALID_INTAKE    (1u << 11) /* MAP and intake air temperature */
+#define DASH_VALID_THROTTLE  (1u << 12)
+#define DASH_VALID_TIMING    (1u << 13)
+#define DASH_VALID_ENGINE    (DASH_VALID_OIL_PRESS | DASH_VALID_LAMBDA | DASH_VALID_INTAKE | \
+                              DASH_VALID_THROTTLE | DASH_VALID_TIMING)
+
+/* Everything the ECU sends: all of the above but the start inputs. */
+#define DASH_VALID_ALL (0x3Fu | DASH_VALID_ENGINE)
 
 /* dash_data_t.warnings: warning lamps. */
 #define DASH_WARN_CHECK_ENGINE (1u << 0) /* the ECU's check engine output is on */
@@ -54,6 +65,14 @@ typedef struct {
     bool estop_active;    /* emergency stop pressed in: the car can't start */
     bool wheel_connected; /* steering wheel plugged in */
     bool clutch_held;     /* clutch pedal down */
+
+    /* Engine data page */
+    uint16_t oil_kpa;       /* oil pressure, gauge */
+    uint16_t lambda_x1000;  /* wideband sensor 1 */
+    uint16_t map_kpa;       /* manifold absolute pressure */
+    int16_t intake_c;       /* intake air temperature */
+    uint8_t throttle_pct;
+    int16_t timing_deg_x10; /* ignition advance, degrees before TDC */
 } dash_data_t;
 
 static inline bool dash_valid(const dash_data_t *d, uint16_t mask)

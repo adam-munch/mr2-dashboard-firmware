@@ -36,13 +36,19 @@ add_executable(${TARGET_NAME}
     src/eve/eve_hal_stm32.c
     src/eve/eve_panels.c
     src/can/can_stm32.c
+    src/input/encoder_stm32.c
+    src/app/dash_menu.c
     src/app/dashboard.c
     src/app/demo_data.c
     src/app/ecu_link.c
     src/app/fixmath.c
     src/app/guide.c
+    src/app/knob.c
     src/app/logo.c
+    src/app/menu.c
+    src/app/pages.c
     src/app/rusefi_can.c
+    src/app/settings.c
     src/app/ui.c
     third_party/cmsis_device_g0/Source/system_stm32g0xx.c
     third_party/cmsis_device_g0/Source/gcc/startup_stm32g0b1xx.s
@@ -55,6 +61,7 @@ target_include_directories(${TARGET_NAME} PRIVATE
     src/board
     src/eve
     src/can
+    src/input
     src/app
     third_party/cmsis_core/Include
     third_party/cmsis_device_g0/Include

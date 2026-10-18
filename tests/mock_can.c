@@ -55,6 +55,7 @@ void can_get_stats(can_stats_t *stats)
 {
     memset(stats, 0, sizeof *stats);
     stats->state = g_can.state;
+    stats->rx_frames = g_can.rx_frames;
     stats->tx_frames = (uint32_t)g_can.tx_len;
     stats->tx_dropped = g_can.tx_dropped;
 }

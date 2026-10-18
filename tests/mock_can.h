@@ -24,6 +24,7 @@ typedef struct {
     bool init_ok;      /* can_init() result (default true) */
     bool tx_full;      /* can_send() fails (default false) */
     can_state_t state; /* reported by can_get_stats() (default ACTIVE) */
+    uint32_t rx_frames; /* reported by can_get_stats() */
 
     can_frame_t rx[MOCK_CAN_MAX_FRAMES];
     size_t rx_len;

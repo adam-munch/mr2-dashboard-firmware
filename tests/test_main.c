@@ -1,6 +1,6 @@
 /*
- * Host tests for the EVE driver, the CAN pipeline, the dashboard renderer
- * and helpers.
+ * Host tests for the EVE driver, the CAN pipeline, the dashboard renderer,
+ * the knob and menus, and helpers.
  * Run: cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
  */
 #include <math.h>
@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "can_queue.h"
+#include "dash_menu.h"
 #include "dashboard.h"
 #include "demo_data.h"
 #include "ecu_link.h"
@@ -16,10 +17,16 @@
 #include "eve_panels.h"
 #include "fixmath.h"
 #include "guide.h"
+#include "knob.h"
 #include "logo.h"
+#include "menu.h"
 #include "mock_can.h"
+#include "mock_encoder.h"
 #include "mock_eve.h"
 #include "rusefi_can.h"
+#include "settings.h"
+#include "ui.h"
+#include "version.h"
 
 static int s_failures;
 static int s_checks;
@@ -49,6 +56,9 @@ static int s_checks;
         printf("%s\n", #test);       \
         mock_eve_reset();            \
         mock_can_reset();            \
+        mock_encoder_reset();        \
+        settings_reset();            \
+        menu_init(&dash_menu);       \
         test();                      \
     } while (0)
 
@@ -829,6 +839,731 @@ static void test_guide_unknown_inputs(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Knob
+ * ------------------------------------------------------------------------ */
+
+static void test_knob_turn(void)
+{
+    knob_init(0);
+    CHECK_EQ(knob_poll(1).turn, 0);
+
+    mock_encoder_turn(1);
+    CHECK_EQ(knob_poll(2).turn, 1);
+    mock_encoder_turn(-3);
+    CHECK(knob_poll(3).turn == -3);
+
+    /* Bounce and wobble around a detent, up to 3 edges either way: never a click. */
+    bool quiet = true;
+    for (int k = 1; k < ENCODER_COUNTS_PER_DETENT; k++) {
+        static const int dir[4] = {1, -1, -1, 1};
+        for (int i = 0; i < 4; i++) {
+            g_enc.count = (uint16_t)(g_enc.count + dir[i] * k);
+            quiet = quiet && knob_poll(4).turn == 0;
+        }
+    }
+    CHECK(quiet);
+
+    /* The click lands on the last edge into the next detent, and bounce on
+     * that edge neither repeats it nor takes it back. */
+    g_enc.count = (uint16_t)(g_enc.count + ENCODER_COUNTS_PER_DETENT - 1);
+    CHECK_EQ(knob_poll(5).turn, 0);
+    g_enc.count++;
+    CHECK_EQ(knob_poll(6).turn, 1);
+    g_enc.count--;
+    CHECK_EQ(knob_poll(7).turn, 0);
+    g_enc.count++;
+    CHECK_EQ(knob_poll(8).turn, 0);
+
+    /* A fast spin while a frame is drawn: every click counts. */
+    mock_encoder_turn(-25);
+    CHECK(knob_poll(9).turn == -25);
+
+    /* Across the 16-bit wrap of the hardware counter. */
+    g_enc.count = 0xFFFEu;
+    knob_init(10);
+    mock_encoder_turn(1);
+    CHECK_EQ(knob_poll(11).turn, 1);
+    mock_encoder_turn(-2);
+    CHECK(knob_poll(12).turn == -2);
+
+    /* Turns before knob_init() (e.g. during the splash) don't count. */
+    mock_encoder_turn(7);
+    knob_init(13);
+    CHECK_EQ(knob_poll(14).turn, 0);
+}
+
+/* Set the switch at `t` and poll. */
+static knob_event_t switch_at(bool pressed, uint32_t t)
+{
+    g_enc.pressed = pressed;
+    return knob_poll(t);
+}
+
+static void test_knob_switch(void)
+{
+    knob_event_t ev;
+    knob_init(0);
+
+    /* A tap with contact bounce at both ends: one press, on the release. */
+    bool quiet = true;
+    quiet = quiet && !switch_at(true, 100).press;
+    quiet = quiet && !switch_at(false, 102).press;
+    quiet = quiet && !switch_at(true, 104).press;
+    quiet = quiet && !switch_at(true, 114).press; /* debounced down: no event until released */
+    quiet = quiet && !switch_at(true, 200).press;
+    quiet = quiet && !switch_at(false, 220).press;
+    quiet = quiet && !switch_at(true, 222).press;
+    quiet = quiet && !switch_at(false, 224).press;
+    quiet = quiet && !switch_at(false, 230).press;
+    CHECK(quiet);
+    ev = switch_at(false, 234);
+    CHECK(ev.press && !ev.hold);
+    CHECK(!switch_at(false, 300).press); /* once */
+
+    /* A glitch shorter than the debounce time is nothing. */
+    switch_at(true, 400);
+    switch_at(false, 400 + KNOB_DEBOUNCE_MS - 1);
+    ev = switch_at(false, 500);
+    CHECK(!ev.press && !ev.hold);
+
+    /* Held: reported once, at KNOB_HOLD_MS while still held; the release
+     * that follows isn't a press. */
+    switch_at(true, 1000);
+    switch_at(true, 1000 + KNOB_DEBOUNCE_MS);
+    CHECK(!switch_at(true, 1000 + KNOB_HOLD_MS - 1).hold);
+    ev = switch_at(true, 1000 + KNOB_HOLD_MS);
+    CHECK(ev.hold && !ev.press);
+    CHECK(!switch_at(true, 1800).hold);
+    switch_at(false, 1900);
+    ev = switch_at(false, 1900 + KNOB_DEBOUNCE_MS);
+    CHECK(!ev.press && !ev.hold);
+
+    /* Let go just before the hold time, but debounced after it: a press. */
+    switch_at(true, 3000);
+    switch_at(true, 3000 + KNOB_DEBOUNCE_MS);
+    switch_at(false, 3000 + KNOB_HOLD_MS - 5);
+    ev = switch_at(false, 3000 + KNOB_HOLD_MS + 10);
+    CHECK(ev.press && !ev.hold);
+
+    /* Held since before knob_init(): ignored until released, then normal. */
+    g_enc.pressed = true;
+    knob_init(5000);
+    ev = switch_at(true, 5000 + 2 * KNOB_HOLD_MS);
+    CHECK(!ev.press && !ev.hold);
+    switch_at(false, 6500);
+    ev = switch_at(false, 6600);
+    CHECK(!ev.press && !ev.hold);
+    switch_at(true, 7000);
+    switch_at(true, 7050);
+    switch_at(false, 7100);
+    CHECK(switch_at(false, 7150).press);
+}
+
+/* ---------------------------------------------------------------------------
+ * Menu engine, against a menu with one of everything
+ * ------------------------------------------------------------------------ */
+
+static int16_t s_t_number;
+static int16_t s_t_live;
+static int16_t s_t_colour;
+static int16_t s_t_switch;
+static int s_t_runs;
+static const char *const k_t_colours[] = {"RED", "GREEN", "BLUE"};
+
+static const char *t_action(void)
+{
+    s_t_runs++;
+    return "DONE";
+}
+
+static void t_page_a(const dash_data_t *d, uint32_t now_ms)
+{
+    eve_cmd_text(400, 300, FONT_MEDIUM, OPT_CENTER, "BODY OF PAGE A");
+}
+
+static void t_page_b(const dash_data_t *d, uint32_t now_ms)
+{
+    eve_cmd_text(400, 300, FONT_MEDIUM, OPT_CENTER, "BODY OF PAGE B");
+}
+
+static const menu_item_t k_t_level5[] = {MENU_ACTION_ITEM("TOO DEEP", t_action)};
+static const menu_item_t k_t_level4[] = {MENU_SUBMENU_ITEM("LEVEL 5", k_t_level5)};
+static const menu_item_t k_t_level3[] = {MENU_SUBMENU_ITEM("LEVEL 4", k_t_level4)};
+static const menu_item_t k_t_level2[] = {MENU_SUBMENU_ITEM("LEVEL 3", k_t_level3)};
+static const menu_item_t k_t_items[] = {
+    MENU_VALUE_ITEM("NUMBER", s_t_number, -5, 5, 2, "MM", 0u),
+    MENU_VALUE_ITEM("LIVE", s_t_live, 0, 100, 10, NULL, MENU_LIVE),
+    MENU_CHOICE_ITEM("COLOUR", s_t_colour, k_t_colours, 0u),
+    MENU_TOGGLE_ITEM("SWITCH", s_t_switch),
+    MENU_ACTION_ITEM("DO IT", t_action),
+    MENU_PAGE_ITEM("PAGE A", t_page_a),
+    MENU_SUBMENU_ITEM("LEVEL 2", k_t_level2),
+    MENU_PAGE_ITEM("PAGE B", t_page_b),
+};
+static const menu_item_t k_t_menu = MENU_SUBMENU_ITEM("TEST MENU", k_t_items);
+
+static uint32_t s_t_now;
+
+static void ev_turn(int16_t clicks)
+{
+    const knob_event_t ev = {clicks, false, false};
+    menu_update(&ev, s_t_now);
+}
+
+static void ev_press(void)
+{
+    const knob_event_t ev = {0, true, false};
+    menu_update(&ev, s_t_now);
+}
+
+static void ev_hold(void)
+{
+    const knob_event_t ev = {0, false, true};
+    menu_update(&ev, s_t_now);
+}
+
+/* Nothing from the knob, `ms` later. */
+static void ev_idle(uint32_t ms)
+{
+    const knob_event_t ev = {0, false, false};
+    s_t_now += ms;
+    menu_update(&ev, s_t_now);
+}
+
+/* The highlighted / edited / shown item is `label`; NULL for a BACK row. */
+static bool at(const char *label)
+{
+    const menu_item_t *it = menu_current();
+    if (label == NULL) {
+        return menu_is_open() && it == NULL;
+    }
+    return it != NULL && strcmp(it->label, label) == 0;
+}
+
+static void open_test_menu(void)
+{
+    s_t_now = 1000;
+    s_t_number = 1;
+    s_t_live = 50;
+    s_t_colour = 0;
+    s_t_switch = 0;
+    s_t_runs = 0;
+    menu_init(&k_t_menu);
+    ev_turn(3); /* turning on the home screen does nothing... */
+    ev_hold();  /* ...nor does holding */
+    CHECK(!menu_is_open());
+    ev_press();
+    CHECK_EQ(menu_view(), MENU_LIST);
+    CHECK(at("NUMBER"));
+}
+
+static void test_menu_navigation(void)
+{
+    open_test_menu();
+
+    /* The highlight stops at the ends, the last row being EXIT. */
+    ev_turn(-1);
+    CHECK(at("NUMBER"));
+    ev_turn(7);
+    CHECK(at("PAGE B"));
+    ev_turn(5);
+    CHECK(at(NULL));
+    ev_turn(-2);
+    CHECK(at("LEVEL 2"));
+
+    /* Into a list and back out: by holding, or with its BACK row. */
+    ev_press();
+    CHECK(at("LEVEL 3"));
+    ev_hold();
+    CHECK(at("LEVEL 2")); /* the parent keeps its place */
+    ev_press();
+    ev_turn(1);
+    CHECK(at(NULL));
+    ev_press();
+    CHECK(at("LEVEL 2"));
+
+    /* Lists nest MENU_MAX_DEPTH deep, and no deeper. */
+    ev_press(); /* into LEVEL 2 */
+    ev_press(); /* LEVEL 3 */
+    ev_press(); /* LEVEL 4: MENU_MAX_DEPTH lists open */
+    CHECK(at("LEVEL 5"));
+    ev_press();
+    CHECK(at("LEVEL 5")); /* doesn't open */
+    for (int i = 0; i < MENU_MAX_DEPTH - 1; i++) {
+        ev_hold();
+    }
+    CHECK(at("LEVEL 2"));
+
+    /* Holding at the top closes the menu; so does EXIT. */
+    ev_hold();
+    CHECK(!menu_is_open());
+    ev_press();
+    CHECK(at("NUMBER")); /* opens at the top again */
+    ev_turn(20);
+    ev_press();
+    CHECK(!menu_is_open());
+}
+
+static void test_menu_editing(void)
+{
+    open_test_menu();
+
+    /* A value: turning steps it within its range, only a press keeps it. */
+    ev_press();
+    CHECK_EQ(menu_view(), MENU_EDIT);
+    ev_turn(1);
+    CHECK_EQ(s_t_number, 1); /* not live: the setting waits */
+    ev_turn(10);
+    ev_turn(1);
+    ev_press();
+    CHECK_EQ(menu_view(), MENU_LIST);
+    CHECK_EQ(s_t_number, 5);
+    ev_press();
+    ev_turn(-100);
+    ev_press();
+    CHECK(s_t_number == -5);
+
+    /* A hold cancels. */
+    ev_press();
+    ev_turn(2);
+    ev_hold();
+    CHECK(s_t_number == -5);
+    CHECK_EQ(menu_view(), MENU_LIST);
+    CHECK(at("NUMBER"));
+
+    /* A live value follows the knob, and a cancel puts it back. */
+    ev_turn(1);
+    ev_press();
+    ev_turn(2);
+    CHECK_EQ(s_t_live, 70);
+    ev_turn(10);
+    CHECK_EQ(s_t_live, 100);
+    ev_hold();
+    CHECK_EQ(s_t_live, 50);
+
+    /* A choice steps through its names and stops at the ends. */
+    ev_turn(1);
+    ev_press();
+    ev_turn(5);
+    ev_press();
+    CHECK_EQ(s_t_colour, 2);
+    ev_press();
+    ev_turn(-1);
+    ev_press();
+    CHECK_EQ(s_t_colour, 1);
+
+    /* A toggle flips on a press, no editor. */
+    ev_turn(1);
+    ev_press();
+    CHECK_EQ(s_t_switch, 1);
+    CHECK_EQ(menu_view(), MENU_LIST);
+    ev_press();
+    CHECK_EQ(s_t_switch, 0);
+
+    /* An action runs on each press. */
+    ev_turn(1);
+    ev_press();
+    ev_press();
+    CHECK_EQ(s_t_runs, 2);
+    CHECK_EQ(menu_view(), MENU_LIST);
+
+    /* A setting that is out of range is pulled into it by the editor. */
+    s_t_live = 999;
+    ev_turn(-3);
+    CHECK(at("LIVE"));
+    ev_press();
+    ev_press();
+    CHECK_EQ(s_t_live, 100);
+}
+
+static void test_menu_pages(void)
+{
+    open_test_menu();
+    ev_turn(5);
+    ev_press();
+    CHECK_EQ(menu_view(), MENU_SHOW_PAGE);
+    CHECK(at("PAGE A"));
+
+    /* Turning goes to the next page in the list, skipping what isn't one,
+     * and stops at the last. */
+    ev_turn(1);
+    CHECK(at("PAGE B"));
+    ev_turn(1);
+    CHECK(at("PAGE B"));
+    ev_turn(-5);
+    CHECK(at("PAGE A"));
+
+    /* A press, or a hold, goes back to the list, on the page last shown. */
+    ev_turn(1);
+    ev_press();
+    CHECK_EQ(menu_view(), MENU_LIST);
+    CHECK(at("PAGE B"));
+    ev_press();
+    ev_hold();
+    CHECK_EQ(menu_view(), MENU_LIST);
+}
+
+static void test_menu_timeout(void)
+{
+    /* A list left alone closes... */
+    open_test_menu();
+    ev_idle(MENU_TIMEOUT_MS - 1);
+    CHECK(menu_is_open());
+    ev_turn(1); /* any input restarts the wait */
+    ev_idle(MENU_TIMEOUT_MS - 1);
+    CHECK(menu_is_open());
+    ev_idle(1);
+    CHECK(!menu_is_open());
+
+    /* ...an edit in progress is dropped... */
+    open_test_menu();
+    ev_press();
+    ev_turn(2);
+    ev_idle(MENU_TIMEOUT_MS);
+    CHECK(!menu_is_open());
+    CHECK_EQ(s_t_number, 1);
+
+    /* ...unless it's live: then it stays as set. */
+    open_test_menu();
+    ev_turn(1);
+    ev_press();
+    ev_turn(-2);
+    ev_idle(MENU_TIMEOUT_MS);
+    CHECK(!menu_is_open());
+    CHECK_EQ(s_t_live, 30);
+
+    /* Pages stay open to be watched. */
+    open_test_menu();
+    ev_turn(5);
+    ev_press();
+    ev_idle(10u * MENU_TIMEOUT_MS);
+    CHECK_EQ(menu_view(), MENU_SHOW_PAGE);
+    ev_press();
+    ev_idle(MENU_TIMEOUT_MS); /* back in the list, the clock runs again */
+    CHECK(!menu_is_open());
+}
+
+/* How many times `n` is drawn with CMD_NUMBER in the captured frame. */
+static int frame_number_count(int32_t n)
+{
+    int hits = 0;
+    const size_t words = mock_fifo_words();
+    for (size_t i = 0; i + 3 < words; i++) {
+        if (mock_fifo_word(i) == CMD_NUMBER && (int32_t)mock_fifo_word(i + 3) == n) {
+            hits++;
+            i += 3;
+        }
+    }
+    return hits;
+}
+
+/* The menu as it is now, as one frame, with the usual frame checks. */
+static void draw_menu_checked(const dash_data_t *d, const char *name)
+{
+    init_ok();
+    CHECK_EQ(dashboard_draw(d, s_t_now), EVE_OK);
+    check_frame(name);
+}
+
+static void test_menu_render(void)
+{
+    const dash_data_t parked = {.coolant_c = 24, .fuel_pct = 72, .battery_mv = 12500, .gear = 1,
+                                .valid = DASH_VALID_ALL | DASH_VALID_INPUTS, .link = DASH_LINK_OK,
+                                .estop_active = true};
+
+    /* Opened over the pre-start guide: the menu replaces it, under the shift
+     * lights and rev bar (whose scale it keeps). */
+    open_test_menu();
+    draw_menu_checked(&parked, "menu: list");
+    CHECK_EQ(frame_text_count("TEST MENU"), 1);
+    CHECK_EQ(frame_text_count("TURN OFF THE E-STOP"), 0);
+    CHECK_EQ(frame_number_count(5), 1); /* "5" on the rev bar scale */
+    CHECK_EQ(frame_text_count("1 MM"), 1);
+    CHECK_EQ(frame_text_count("50"), 1); /* no unit */
+    CHECK_EQ(frame_text_count("RED"), 1);
+    CHECK_EQ(frame_text_count("OFF"), 1);
+    CHECK_EQ(frame_text_count(">"), 1); /* PAGE A; 6 of the 9 rows are on screen */
+    CHECK_EQ(frame_text_count("EXIT"), 0);
+    CHECK_EQ(frame_text_count("TURN: SELECT     PRESS: EDIT     HOLD: EXIT"), 1);
+
+    /* Scrolled to the end: EXIT shows, the top rows don't. */
+    ev_turn(20);
+    draw_menu_checked(&parked, "menu: scrolled");
+    CHECK_EQ(frame_text_count("EXIT"), 1);
+    CHECK_EQ(frame_text_count("NUMBER"), 0);
+    CHECK_EQ(frame_text_count("TURN: SELECT     PRESS: EXIT     HOLD: EXIT"), 1);
+    ev_turn(-20);
+
+    /* Editing: the value between arrows, the bar, and the hint for it. */
+    ev_press();
+    ev_turn(1);
+    draw_menu_checked(&parked, "menu: editing");
+    CHECK_EQ(frame_text_count("3 MM"), 1);
+    CHECK_EQ(frame_text_count("<"), 1);
+    CHECK_EQ(frame_text_count("TURN: ADJUST     PRESS: KEEP     HOLD: CANCEL"), 1);
+    ev_press();
+
+    /* An action's message replaces the hint for a while. */
+    ev_turn(4);
+    ev_press();
+    draw_menu_checked(&parked, "menu: toast");
+    CHECK_EQ(frame_text_count("DONE"), 1);
+    CHECK_EQ(frame_text_count("TURN: SELECT     PRESS: RUN     HOLD: EXIT"), 0);
+    ev_idle(MENU_TOAST_MS);
+    draw_menu_checked(&parked, "menu: toast gone");
+    CHECK_EQ(frame_text_count("DONE"), 0);
+    CHECK_EQ(frame_text_count("TURN: SELECT     PRESS: RUN     HOLD: EXIT"), 1);
+
+    /* A page: its title and body, and the hint to the next page. */
+    ev_turn(1);
+    ev_press();
+    draw_menu_checked(&parked, "menu: page");
+    CHECK_EQ(frame_text_count("PAGE A"), 1);
+    CHECK_EQ(frame_text_count("BODY OF PAGE A"), 1);
+    CHECK_EQ(frame_text_count("NUMBER"), 0);
+    CHECK_EQ(frame_text_count("TURN: NEXT PAGE     PRESS: BACK"), 1);
+
+    /* Nested: BACK instead of EXIT. */
+    ev_press();
+    ev_turn(1);
+    ev_press();
+    ev_turn(1);
+    draw_menu_checked(&parked, "menu: nested");
+    CHECK_EQ(frame_text_count("LEVEL 2"), 1);
+    CHECK_EQ(frame_text_count("BACK"), 1);
+    CHECK_EQ(frame_text_count("TURN: SELECT     PRESS: BACK     HOLD: BACK"), 1);
+
+    /* Over the gauges, with the engine running: the speed and vitals give
+     * way, the alert moves up beside the title and still flashes. */
+    dash_data_t hot = {.rpm = 5850, .speed_kph = 81, .coolant_c = 110, .fuel_pct = 9, .battery_mv = 14200,
+                       .gear = 3, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK};
+    s_t_now = 0;
+    draw_menu_checked(&hot, "menu: alert");
+    CHECK_EQ(frame_text_count("KM/H"), 0);
+    CHECK_EQ(frame_text_count("COOLANT"), 0);
+    CHECK_EQ(frame_text_count("COOLANT HOT  +1"), 1);
+    s_t_now = 250;
+    draw_menu_checked(&hot, "menu: alert, flash off");
+    CHECK_EQ(frame_text_count("COOLANT HOT  +1"), 0);
+
+    /* Closed: back to whatever the home screen is. */
+    menu_close();
+    draw_menu_checked(&hot, "menu closed");
+    CHECK_EQ(frame_text_count("KM/H"), 1);
+    CHECK_EQ(frame_text_count("LEVEL 2"), 0);
+
+    /* The rev sweep is always the gauges, menu or not. */
+    open_test_menu();
+    init_ok();
+    CHECK_EQ(dashboard_rev_sweep(&hot, 10), EVE_OK);
+    CHECK(frame_text_count("KM/H") > 2);
+    CHECK_EQ(frame_text_count("TEST MENU"), 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * The dashboard's menu and its demo features
+ * ------------------------------------------------------------------------ */
+
+static void test_dash_menu(void)
+{
+    const dash_data_t d = {.rpm = 3000, .speed_kph = 97, .coolant_c = 88, .fuel_pct = 60, .battery_mv = 14100,
+                           .gear = 3, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK};
+    s_t_now = 1000;
+    menu_init(&dash_menu);
+    ev_press();
+    CHECK(at("ENGINE DATA"));
+    draw_menu_checked(&d, "dash menu");
+    CHECK_EQ(frame_text_count("MENU"), 1);
+    CHECK_EQ(frame_text_count("EXIT"), 1); /* everything fits on one screen */
+
+    /* DISPLAY > BRIGHTNESS: live, in steps of 10, never below the minimum. */
+    ev_turn(1);
+    ev_press();
+    CHECK(at("BRIGHTNESS"));
+    draw_menu_checked(&d, "dash menu: display");
+    CHECK_EQ(frame_text_count("100 %"), 1);
+    CHECK_EQ(frame_text_count("KM/H"), 1);
+    CHECK_EQ(frame_text_count("ON"), 1);
+    ev_press();
+    ev_turn(-3);
+    CHECK_EQ(g_settings.brightness_pct, 70);
+    draw_menu_checked(&d, "dash menu: brightness");
+    CHECK_EQ(frame_text_count("70 %"), 1);
+    ev_turn(-20);
+    CHECK_EQ(g_settings.brightness_pct, SETTINGS_BRIGHTNESS_MIN);
+    ev_press();
+
+    /* SPEED UNITS: the main screen follows once it's kept. */
+    ev_turn(1);
+    ev_press();
+    ev_turn(1);
+    CHECK_EQ(g_settings.speed_units, SPEED_KPH);
+    ev_press();
+    CHECK_EQ(g_settings.speed_units, SPEED_MPH);
+
+    /* SHIFT FLASH */
+    ev_turn(1);
+    ev_press();
+    CHECK_EQ(g_settings.shift_flash, 0);
+
+    /* ECU MODE: nothing is sent on the way to the value, only once it's kept. */
+    ev_hold();
+    ev_turn(1);
+    CHECK(at("ECU MODE"));
+    ev_press();
+    ev_turn(3);
+    CHECK_EQ(g_settings.ecu_mode, 0);
+    ev_press();
+    CHECK_EQ(g_settings.ecu_mode, 3);
+    ev_press();
+    ev_turn(20);
+    ev_press();
+    CHECK_EQ(g_settings.ecu_mode, SETTINGS_ECU_MODE_MAX);
+
+    /* RESTORE DEFAULTS, with a confirmation. */
+    ev_turn(2);
+    CHECK(at("RESTORE DEFAULTS"));
+    ev_press();
+    CHECK_EQ(g_settings.brightness_pct, 100);
+    CHECK_EQ(g_settings.speed_units, SPEED_KPH);
+    CHECK_EQ(g_settings.shift_flash, 1);
+    CHECK_EQ(g_settings.ecu_mode, 0);
+    draw_menu_checked(&d, "dash menu: restored");
+    CHECK_EQ(frame_text_count("DEFAULTS RESTORED"), 1);
+
+    /* The two pages are next to each other for the knob. */
+    ev_turn(-4);
+    ev_press();
+    CHECK(at("ENGINE DATA"));
+    ev_turn(1);
+    CHECK(at("DIAGNOSTICS"));
+}
+
+static void test_settings_on_screen(void)
+{
+    dash_data_t d = {.rpm = 3000, .speed_kph = 97, .coolant_c = 88, .fuel_pct = 60, .battery_mv = 14100,
+                     .gear = 3, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK};
+
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_number_count(97), 1);
+    CHECK_EQ(frame_text_count("KM/H"), 1);
+
+    g_settings.speed_units = SPEED_MPH;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_number_count(60), 1); /* 97 km/h is 60.3 mph */
+    CHECK_EQ(frame_text_count("MPH"), 1);
+    CHECK_EQ(frame_text_count("KM/H"), 0);
+    d.speed_kph = 255;
+    init_ok();
+    CHECK_EQ(dashboard_draw(&d, 0), EVE_OK);
+    CHECK_EQ(frame_number_count(158), 1); /* 158.4 */
+
+    /* At the shift point the lights flash at 5 Hz, or stay lit with the
+     * flash off. */
+    d.rpm = 6600;
+    int vertices[2][2];
+    for (int flash = 0; flash < 2; flash++) {
+        g_settings.shift_flash = (int16_t)flash;
+        for (int phase = 0; phase < 2; phase++) {
+            init_ok();
+            CHECK_EQ(dashboard_draw(&d, (uint32_t)phase * 100u), EVE_OK);
+            vertices[flash][phase] = frame_vertices();
+        }
+    }
+    CHECK(vertices[1][0] > vertices[1][1]); /* flashing: off half the time */
+    CHECK_EQ(vertices[0][0], vertices[0][1]);
+    CHECK_EQ(vertices[0][0], vertices[1][0]);
+}
+
+static void test_pages(void)
+{
+    /* Engine data: every reading, formatted on its own scale. */
+    dash_data_t d = {.rpm = 3456, .speed_kph = 97, .coolant_c = 88, .fuel_pct = 62, .battery_mv = 13850,
+                     .gear = 3, .valid = DASH_VALID_ALL, .link = DASH_LINK_OK, .oil_kpa = 350,
+                     .lambda_x1000 = 853, .map_kpa = 101, .intake_c = -10, .throttle_pct = 44,
+                     .timing_deg_x10 = -55};
+    s_t_now = 1000;
+    menu_init(&dash_menu);
+    ev_press();
+    ev_press();
+    CHECK_EQ(menu_view(), MENU_SHOW_PAGE);
+    draw_menu_checked(&d, "page: engine");
+    CHECK_EQ(frame_text_count("ENGINE DATA"), 1);
+    CHECK_EQ(frame_text_count("3.5"), 1);
+    CHECK_EQ(frame_text_count("0.85"), 1);
+    CHECK_EQ(frame_text_count("101"), 1);
+    CHECK_EQ(frame_text_count("-10"), 1);
+    CHECK_EQ(frame_text_count("44"), 1);
+    CHECK_EQ(frame_text_count("-5.5"), 1);
+    CHECK_EQ(frame_text_count("--"), 0);
+    CHECK_EQ(frame_text_count("TURN: NEXT PAGE     PRESS: BACK"), 1);
+
+    /* Extremes stay in their tiles and on screen. */
+    d.oil_kpa = 65535;
+    d.lambda_x1000 = 65535;
+    d.map_kpa = 65535;
+    d.intake_c = -32768;
+    d.throttle_pct = 255;
+    d.timing_deg_x10 = 32767;
+    draw_menu_checked(&d, "page: engine, extremes");
+
+    /* Without the ECU (or without the sensors), every reading is "--". */
+    d.valid = DASH_VALID_RPM | DASH_VALID_SPEED;
+    d.link = DASH_LINK_LOST;
+    draw_menu_checked(&d, "page: engine, no data");
+    CHECK_EQ(frame_text_count("--"), 6);
+    CHECK_EQ(frame_text_count("-5.5"), 0);
+    CHECK_EQ(frame_text_count("NO DATA FROM ECU"), 1); /* the status line stays */
+
+    /* Diagnostics */
+    ev_turn(1);
+    CHECK(at("DIAGNOSTICS"));
+    g_enc.count = 1234;
+    g_enc.pressed = true;
+    g_can.state = CAN_STATE_PASSIVE;
+    g_can.tx_dropped = 17;
+    s_t_now = 3723000; /* 1:02:03 */
+    draw_menu_checked(&d, "page: diagnostics");
+    CHECK_EQ(frame_text_count("DIAGNOSTICS"), 1);
+    CHECK_EQ(frame_text_count(FW_VERSION), 1);
+    CHECK_EQ(frame_text_count("FT812"), 1);
+    CHECK_EQ(frame_text_count("1:02:03"), 1);
+    CHECK_EQ(frame_text_count("NO DATA"), 1);
+    CHECK_EQ(frame_text_count("1234"), 1);
+    CHECK_EQ(frame_text_count("PRESSED"), 1);
+    CHECK_EQ(frame_text_count("PASSIVE"), 1);
+    CHECK_EQ(frame_text_count("17"), 1);
+    CHECK_EQ(frame_text_count("TURN: NEXT PAGE     PRESS: BACK"), 1);
+
+    static const struct {
+        can_state_t state;
+        const char *text;
+    } states[] = {
+        {CAN_STATE_STOPPED, "STOPPED"}, {CAN_STATE_ACTIVE, "ACTIVE"}, {CAN_STATE_WARNING, "WARNING"},
+        {CAN_STATE_PASSIVE, "PASSIVE"}, {CAN_STATE_BUS_OFF, "BUS OFF"},
+    };
+    for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+        g_can.state = states[i].state;
+        draw_menu_checked(&d, "page: diagnostics, CAN state");
+        CHECK_EQ(frame_text_count(states[i].text), 1);
+    }
+    static const struct {
+        dash_link_t link;
+        const char *text;
+    } links[] = {
+        {DASH_LINK_OK, "RECEIVING"}, {DASH_LINK_DEMO, "DEMO DATA"}, {DASH_LINK_WAITING, "WAITING"},
+        {DASH_LINK_LOST, "NO DATA"},  {DASH_LINK_CAN_FAULT, "CAN FAULT"},
+    };
+    for (size_t i = 0; i < sizeof links / sizeof links[0]; i++) {
+        d.link = links[i].link;
+        draw_menu_checked(&d, "page: diagnostics, link");
+        CHECK(frame_text_count(links[i].text) >= 1);
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Logo
  * ------------------------------------------------------------------------ */
 
@@ -1008,6 +1743,8 @@ static void test_demo_data(void)
     bool cranked_when_not_allowed = false;
     bool started = false;
     bool stalled = false;
+    bool engine_sane = true;
+    bool saw_boost = false;
 
     for (uint32_t t = 0; t <= 120000; t += 16) { /* two minutes at 60 fps */
         demo_data_update(&d, t);
@@ -1037,7 +1774,16 @@ static void test_demo_data(void)
         } else {
             stalled = stalled || started;
         }
+
+        /* The engine data page: boost on the pulls, and a lambda reading
+         * only while the engine runs. */
+        engine_sane = engine_sane && d.map_kpa >= 20 && d.map_kpa <= 200 && d.throttle_pct <= 100 &&
+                      d.intake_c >= 20 && d.intake_c <= 50 && d.oil_kpa <= 500 &&
+                      dash_valid(&d, DASH_VALID_LAMBDA) == dash_engine_running(&d);
+        saw_boost = saw_boost || d.map_kpa > 150;
     }
+    CHECK(engine_sane);
+    CHECK(saw_boost);
     CHECK(sane);
     CHECK(starts_at_estop);
     CHECK(steps_in_order);
@@ -1424,6 +2170,14 @@ static void test_ecu_link_pipeline(void)
     CHECK_EQ(d.warnings, DASH_WARN_CHECK_ENGINE | DASH_WARN_LIMITER);
     CHECK_EQ(ecu_link_data()->map_kpa_x30, 3039); /* the full decode is available too */
 
+    /* The engine data page's values. */
+    CHECK_EQ(d.oil_kpa, 350);
+    CHECK_EQ(d.lambda_x1000, 850);
+    CHECK_EQ(d.map_kpa, 101);
+    CHECK(d.intake_c == -10);
+    CHECK_EQ(d.throttle_pct, 44);
+    CHECK(d.timing_deg_x10 == -55);
+
     /* Values expire together with their message; then the link is lost. */
     ecu_link_get_dash(&d, 100 + ECU_DATA_TIMEOUT_MS - 1);
     CHECK_EQ(d.valid, DASH_VALID_ALL);
@@ -1432,12 +2186,13 @@ static void test_ecu_link_pipeline(void)
     CHECK_EQ(d.warnings, 0);
     CHECK_EQ(d.link, DASH_LINK_LOST);
 
-    /* Only rpm/speed arrive: only those are valid, but the link is up. */
+    /* Only rpm/speed arrive: only those (and the timing, from the same
+     * message) are valid, but the link is up. */
     inject_rpm(2000, 3000);
     ecu_link_poll(3000);
     ecu_link_get_dash(&d, 3000);
     CHECK_EQ(d.link, DASH_LINK_OK);
-    CHECK_EQ(d.valid, DASH_VALID_RPM | DASH_VALID_SPEED);
+    CHECK_EQ(d.valid, DASH_VALID_RPM | DASH_VALID_SPEED | DASH_VALID_TIMING);
     CHECK_EQ(d.rpm, 2000);
 
     /* A gear the screen can't show is dropped, not drawn as garbage. */
@@ -1455,6 +2210,48 @@ static void test_ecu_link_pipeline(void)
     g_can.state = CAN_STATE_PASSIVE; /* passive alone isn't a fault: e.g. we're the only node acking */
     ecu_link_get_dash(&d, 3000);
     CHECK_EQ(d.link, DASH_LINK_OK);
+}
+
+static void test_ecu_link_missing_sensors(void)
+{
+    dash_data_t d;
+    CHECK(ecu_link_init(0));
+
+    /* No throttle sensor, no oil pressure sensor, no wideband: those values
+     * are "--", the rest of their messages still count. */
+    inject_broadcast(100);
+    can_frame_t f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_PEDAL_TPS, 100);
+    dbc_put(&f, 16, 16, dbc_raw(-1.0, 0.01, 0));
+    mock_can_inject(&f);
+    f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_SENSORS2, 100);
+    dbc_put(&f, 16, 16, RUSEFI_OIL_PRESS_NO_SENSOR);
+    dbc_put(&f, 48, 16, 13850);
+    mock_can_inject(&f);
+    f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_FUELING3, 100); /* lambda 0 */
+    mock_can_inject(&f);
+    ecu_link_poll(100);
+    ecu_link_get_dash(&d, 100);
+    CHECK_EQ(d.valid, DASH_VALID_ALL & ~(DASH_VALID_THROTTLE | DASH_VALID_OIL_PRESS | DASH_VALID_LAMBDA));
+    CHECK_EQ(d.battery_mv, 13850);
+
+    /* Readings a little out of range are clamped, not wrapped. */
+    f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_PEDAL_TPS, 200);
+    dbc_put(&f, 16, 16, dbc_raw(100.6, 0.01, 0));
+    mock_can_inject(&f);
+    f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_SENSORS2, 200);
+    dbc_put(&f, 16, 16, dbc_raw(-0.5, 1.0 / 30, 0));
+    mock_can_inject(&f);
+    ecu_link_poll(200);
+    ecu_link_get_dash(&d, 200);
+    CHECK(dash_valid(&d, DASH_VALID_THROTTLE | DASH_VALID_OIL_PRESS));
+    CHECK_EQ(d.throttle_pct, 100);
+    CHECK_EQ(d.oil_kpa, 0);
+    f = rusefi_frame(ECU_RUSEFI_BASE_ID, RUSEFI_MSG_PEDAL_TPS, 300);
+    dbc_put(&f, 16, 16, dbc_raw(-2.0, 0.01, 0));
+    mock_can_inject(&f);
+    ecu_link_poll(300);
+    ecu_link_get_dash(&d, 300);
+    CHECK_EQ(d.throttle_pct, 0);
 }
 
 static void test_ecu_link_timestamps(void)
@@ -1640,6 +2437,16 @@ int main(void)
     RUN(test_dashboard_alerts);
     RUN(test_guide_screens);
     RUN(test_guide_unknown_inputs);
+    RUN(test_knob_turn);
+    RUN(test_knob_switch);
+    RUN(test_menu_navigation);
+    RUN(test_menu_editing);
+    RUN(test_menu_pages);
+    RUN(test_menu_timeout);
+    RUN(test_menu_render);
+    RUN(test_dash_menu);
+    RUN(test_settings_on_screen);
+    RUN(test_pages);
     RUN(test_logo_outline);
     RUN(test_logo_draw);
     RUN(test_rev_sweep);
@@ -1649,6 +2456,7 @@ int main(void)
     RUN(test_rusefi_decode);
     RUN(test_rusefi_rejects);
     RUN(test_ecu_link_pipeline);
+    RUN(test_ecu_link_missing_sensors);
     RUN(test_ecu_link_timestamps);
     RUN(test_ecu_link_ignores_other_traffic);
     RUN(test_ecu_link_can_init_fails);

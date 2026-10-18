@@ -5,7 +5,8 @@
  *
  * Boot: splash -> backlight fade-in -> start lights -> rev sweep -> live screen,
  * which guides the driver through starting the engine (e-stop, steering
- * wheel, start button) and then shows the gauges.
+ * wheel, start button) and then shows the gauges. Pressing the rotary knob
+ * opens the menu (dash_menu.c) over either.
  * Values come from the ECU's CAN broadcast (ecu_link.c), or from a
  * built-in simulation when built with DASH_DEMO_DATA=1. If the display
  * stops responding, it is re-initialised once a second; the CAN link keeps
@@ -16,11 +17,15 @@
 #include "board.h"
 #include "can.h"
 #include "clock.h"
+#include "dash_menu.h"
 #include "dashboard.h"
 #include "demo_data.h"
 #include "ecu_link.h"
+#include "encoder.h"
 #include "eve.h"
 #include "eve_panels.h"
+#include "knob.h"
+#include "settings.h"
 #include "systick.h"
 #include "version.h"
 
@@ -29,7 +34,7 @@
 #endif
 
 #define FRAME_PERIOD_MS    16u  /* ~60 fps, matching the panel's 61.6 Hz */
-#define BACKLIGHT_DUTY     128u /* 0..128. Full brightness draws ~760 mA from VBL at 3.3 V */
+#define BACKLIGHT_DUTY     128u /* 0..128 at 100 % brightness. Full duty draws ~760 mA from VBL at 3.3 V */
 #define BACKLIGHT_FADE_MS  400u
 #define START_LIGHT_MS     200u /* between start lights, and before lights out */
 #define REV_SWEEP_MS       1500u
@@ -43,6 +48,12 @@ static void wait_ms(uint32_t ms)
     while ((uint32_t)(millis() - start) <= ms) {
         ecu_link_poll(millis());
     }
+}
+
+/* Backlight duty for the brightness setting. */
+static uint8_t backlight_duty(void)
+{
+    return (uint8_t)(BACKLIGHT_DUTY * (uint32_t)g_settings.brightness_pct / 100u);
 }
 
 static void backlight_fade_in(uint8_t target, uint32_t duration_ms)
@@ -110,7 +121,8 @@ static eve_status_t run_dashboard(void)
         return st;
     }
     ecu_link_set_display_ok(true);
-    backlight_fade_in(BACKLIGHT_DUTY, BACKLIGHT_FADE_MS);
+    uint8_t duty = backlight_duty();
+    backlight_fade_in(duty, BACKLIGHT_FADE_MS);
 
     for (uint32_t lights = 1u; lights <= DASHBOARD_START_LIGHTS; lights++) {
         wait_ms(START_LIGHT_MS);
@@ -135,6 +147,10 @@ static eve_status_t run_dashboard(void)
     if (DASH_DEMO_DATA) {
         demo_data_init(&data, millis());
     }
+    /* The knob only counts from here: turns and presses during the splash
+     * are dropped. */
+    knob_init(millis());
+    menu_init(&dash_menu);
 
     uint32_t last_frame = millis();
     uint32_t last_beat = last_frame;
@@ -144,6 +160,10 @@ static eve_status_t run_dashboard(void)
 
         ecu_link_poll(now);
         log_link_state(now);
+
+        const knob_event_t knob = knob_poll(now);
+        menu_update(&knob, now);
+        ecu_link_set_mode((uint8_t)g_settings.ecu_mode);
 
         if ((uint32_t)(now - last_beat) >= HEARTBEAT_MS) {
             last_beat = now;
@@ -159,6 +179,10 @@ static eve_status_t run_dashboard(void)
 
         /* Let the previous frame finish before queueing the next one. */
         st = eve_cmd_wait_idle(100u);
+        if (st == EVE_OK && backlight_duty() != duty) {
+            duty = backlight_duty();
+            eve_backlight_set(duty);
+        }
         if (st == EVE_OK) {
             st = dashboard_draw(&data, now);
         }
@@ -178,6 +202,8 @@ int main(void)
     if (BOARD_HSE_HZ != 0u && !clock_using_hse()) {
         printf("Clock: crystal did not start, CAN timing may be off\n");
     }
+
+    encoder_hw_init();
 
     if (ecu_link_init(millis())) {
         printf("CAN: %lu kbit/s, rusEFI broadcast at 0x%03lX, dash status at 0x%03lX\n",
