@@ -16,6 +16,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
+option(MR2_DEMO_DATA "Show simulated data instead of the ECU's CAN data" OFF)
+
 set(TARGET_NAME mr2-dashboard)
 set(LINKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/linker/STM32G0B1CBTX_FLASH.ld")
 
@@ -33,11 +35,14 @@ add_executable(${TARGET_NAME}
     src/eve/eve.c
     src/eve/eve_hal_stm32.c
     src/eve/eve_panels.c
+    src/can/can_stm32.c
     src/app/dashboard.c
     src/app/demo_data.c
+    src/app/ecu_link.c
     src/app/fixmath.c
     src/app/guide.c
     src/app/logo.c
+    src/app/rusefi_can.c
     src/app/ui.c
     third_party/cmsis_device_g0/Source/system_stm32g0xx.c
     third_party/cmsis_device_g0/Source/gcc/startup_stm32g0b1xx.s
@@ -49,12 +54,13 @@ target_include_directories(${TARGET_NAME} PRIVATE
     src
     src/board
     src/eve
+    src/can
     src/app
     third_party/cmsis_core/Include
     third_party/cmsis_device_g0/Include
 )
 
-target_compile_definitions(${TARGET_NAME} PRIVATE STM32G0B1xx)
+target_compile_definitions(${TARGET_NAME} PRIVATE STM32G0B1xx $<$<BOOL:${MR2_DEMO_DATA}>:DASH_DEMO_DATA=1>)
 
 target_compile_options(${TARGET_NAME} PRIVATE
     ${MCU_FLAGS}

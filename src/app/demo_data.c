@@ -73,6 +73,9 @@ void demo_data_init(dash_data_t *d, uint32_t now_ms)
     d->fuel_pct = 72u;
     d->battery_mv = PARKED_MV;
     d->gear = 1u;
+    d->valid = DASH_VALID_ALL | DASH_VALID_INPUTS;
+    d->warnings = 0u;
+    d->link = DASH_LINK_DEMO;
     d->estop_active = true;
     d->wheel_connected = false;
     d->clutch_held = false;

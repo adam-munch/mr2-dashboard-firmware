@@ -17,10 +17,13 @@
  *   | rev bar 0..8000 rpm with the redline zone tinted               |
  *   |                                                                |
  *   |     SPEED              [ GEAR ]              RPM               |
- *   |                       [ alert  ]  (only when there is one)     |
- *   |                                                                |
+ *   |  [CHECK ENGINE]        [ alert  ]         [ LIMITER ]          |
+ *   |      (lamps and the alert only appear when they are on)        |
  *   | [ COOLANT        ]  [ FUEL          ]  [ BATTERY       ]      |
+ *   |                                         link status, if not OK |
  *   +----------------------------------------------------------------+
+ *
+ * Values the ECU isn't currently sending (see dash_data_t.valid) show "--".
  */
 
 /* Engine and warning thresholds */
@@ -75,6 +78,11 @@
 #define ALERT_X1 512
 #define ALERT_Y0 284
 #define ALERT_Y1 318
+
+/* Warning lamps either side of it, under speed and rpm */
+#define LAMP_W 200
+
+#define NO_VALUE "--"
 
 /* Vitals tiles along the bottom */
 #define TILE_COUNT 3u
@@ -149,7 +157,7 @@ static vital_status_t fuel_status(uint8_t pct)
     return (vital_status_t){LEVEL_OK, NULL, NULL};
 }
 
-static vital_status_t battery_status(uint16_t mv, uint16_t rpm)
+static vital_status_t battery_status(uint16_t mv, bool engine_running)
 {
     if (mv < BATT_LOW_MV) {
         return (vital_status_t){LEVEL_WARN, "LOW", "BATTERY LOW"};
@@ -158,7 +166,7 @@ static vital_status_t battery_status(uint16_t mv, uint16_t rpm)
         return (vital_status_t){LEVEL_WARN, "HIGH", "VOLTAGE HIGH"};
     }
     /* With the engine running the alternator should be charging. */
-    if (rpm >= DASH_RPM_RUNNING && mv < BATT_CHARGING_MV) {
+    if (engine_running && mv < BATT_CHARGING_MV) {
         return (vital_status_t){LEVEL_WARN, "NO CHG", "NOT CHARGING"};
     }
     return (vital_status_t){LEVEL_OK, NULL, NULL};
@@ -281,7 +289,8 @@ static void draw_rev_bar(uint32_t rpm)
  * Centre row
  * ------------------------------------------------------------------------ */
 
-static void draw_gear(uint8_t gear, uint32_t rpm, bool flash_on)
+/* `rpm` is what the lights and bar show: 0 when the ECU isn't sending it. */
+static void draw_gear(const dash_data_t *d, uint32_t rpm, bool flash_on)
 {
     const bool shift_now = rpm >= RPM_SHIFT && flash_on;
 
@@ -289,23 +298,59 @@ static void draw_gear(uint8_t gear, uint32_t rpm, bool flash_on)
     ui_rect(GEAR_X0, GEAR_Y0, GEAR_X1, GEAR_Y1, shift_stage_colour(rpm, COL_PANEL_EDGE), 10);
     ui_rect(GEAR_X0 + 3, GEAR_Y0 + 3, GEAR_X1 - 3, GEAR_Y1 - 3, shift_now ? COL_PURPLE : COL_PANEL, 8);
 
-    const char gear_str[2] = {gear == 0u ? 'N' : (char)('0' + gear), '\0'};
-    eve_color(gear == 0u && !shift_now ? COL_GREEN : COL_TEXT);
+    char gear_str[2] = {'-', '\0'};
+    if (dash_valid(d, DASH_VALID_GEAR) && d->gear <= 9u) {
+        gear_str[0] = d->gear == 0u ? 'N' : (char)('0' + d->gear);
+    }
+    if (gear_str[0] == '-') {
+        eve_color(COL_TEXT_DIM);
+    } else {
+        eve_color(gear_str[0] == 'N' && !shift_now ? COL_GREEN : COL_TEXT);
+    }
     ui_text_heavy((GEAR_X0 + GEAR_X1) / 2, (GEAR_Y0 + GEAR_Y1) / 2, FONT_HUGE, gear_str);
 }
 
-static void draw_speed_rpm(uint32_t speed_kph, uint32_t rpm)
+static void draw_speed_rpm(const dash_data_t *d)
 {
-    eve_color(COL_TEXT);
-    eve_cmd_number(SPEED_X, VALUE_Y, FONT_HUGE, OPT_CENTER, (int32_t)speed_kph);
+    if (dash_valid(d, DASH_VALID_SPEED)) {
+        eve_color(COL_TEXT);
+        eve_cmd_number(SPEED_X, VALUE_Y, FONT_HUGE, OPT_CENTER, (int32_t)d->speed_kph);
+    } else {
+        eve_color(COL_TEXT_DIM);
+        eve_cmd_text(SPEED_X, VALUE_Y, FONT_HUGE, OPT_CENTER, NO_VALUE);
+    }
     eve_color(COL_TEXT_DIM);
     eve_cmd_text(SPEED_X, VALUE_Y + 64, FONT_SMALL, OPT_CENTER, "KM/H");
 
     /* rpm is also on the bar and the shift lights, so it gets the smaller font. */
-    eve_color(rpm >= RPM_REDLINE ? COL_RED : COL_TEXT);
-    eve_cmd_number(RPM_X, VALUE_Y, FONT_BIG, OPT_CENTER, (int32_t)rpm);
+    if (dash_valid(d, DASH_VALID_RPM)) {
+        eve_color(d->rpm >= RPM_REDLINE ? COL_RED : COL_TEXT);
+        eve_cmd_number(RPM_X, VALUE_Y, FONT_BIG, OPT_CENTER, (int32_t)d->rpm);
+    } else {
+        eve_color(COL_TEXT_DIM);
+        eve_cmd_text(RPM_X, VALUE_Y, FONT_BIG, OPT_CENTER, NO_VALUE);
+    }
     eve_color(COL_TEXT_DIM);
     eve_cmd_text(RPM_X, VALUE_Y + 64, FONT_SMALL, OPT_CENTER, "RPM");
+}
+
+/* The ECU's warning lamps, as pills in line with the alert slot. Like real
+ * telltales they are only there while they are on. */
+static void draw_lamp(int32_t cx, const char *label, uint32_t rgb)
+{
+    ui_rect(cx - LAMP_W / 2, ALERT_Y0, cx + LAMP_W / 2, ALERT_Y1, rgb, (ALERT_Y1 - ALERT_Y0) / 2);
+    eve_color(COL_BG);
+    eve_cmd_text((int16_t)cx, (ALERT_Y0 + ALERT_Y1) / 2, FONT_SMALL, OPT_CENTER, label);
+}
+
+static void draw_lamps(uint8_t warnings)
+{
+    if ((warnings & DASH_WARN_CHECK_ENGINE) != 0u) {
+        draw_lamp(SPEED_X, "CHECK ENGINE", COL_AMBER);
+    }
+    if ((warnings & DASH_WARN_LIMITER) != 0u) {
+        draw_lamp(RPM_X, "LIMITER", COL_RED);
+    }
 }
 
 /* The most severe alert, plus how many more there are. Critical ones flash.
@@ -345,6 +390,7 @@ typedef struct {
     const char *label;
     const char *unit;
     bool degree;       /* draw a degree ring in front of the unit */
+    bool known;        /* false: the ECU isn't sending it; value is NO_VALUE */
     const char *value;
     uint32_t fill;     /* bar fill, permille */
     uint32_t zone_lo;  /* part of the bar tinted as the danger zone, permille */
@@ -377,7 +423,7 @@ static void draw_tile(uint32_t index, const tile_t *t)
     }
 
     /* Value, and a status word only when there is something to say */
-    eve_color(colour);
+    eve_color(t->known ? colour : COL_TEXT_DIM);
     eve_cmd_text((int16_t)(x0 + TILE_PAD - 2), TILE_Y0 + 54, FONT_VALUE, OPT_CENTERY, t->value);
     if (t->status.word != NULL) {
         eve_cmd_text((int16_t)(x1 - 16), TILE_Y0 + 58, FONT_SMALL, OPT_RIGHTX | OPT_CENTERY, t->status.word);
@@ -406,9 +452,10 @@ static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
     snprintf(battery, sizeof battery, "%u.%u", (unsigned)(d->battery_mv / 1000u),
              (unsigned)((d->battery_mv % 1000u) / 100u));
 
-    const tile_t tiles[TILE_COUNT] = {
+    tile_t tiles[TILE_COUNT] = {
         {
             .label = "COOLANT", .unit = "C", .degree = true, .value = coolant,
+            .known = dash_valid(d, DASH_VALID_COOLANT),
             .fill = clamp_permille(d->coolant_c, COOLANT_BAR_MIN, COOLANT_BAR_MAX),
             .zone_lo = clamp_permille(COOLANT_HOT_C, COOLANT_BAR_MIN, COOLANT_BAR_MAX),
             .zone_hi = 1000u,
@@ -416,6 +463,7 @@ static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
         },
         {
             .label = "FUEL", .unit = "%", .value = fuel,
+            .known = dash_valid(d, DASH_VALID_FUEL),
             .fill = clamp_permille(d->fuel_pct, 0, 100),
             .zone_lo = 0u,
             .zone_hi = clamp_permille(FUEL_LOW_PCT, 0, 100),
@@ -423,15 +471,21 @@ static void draw_vitals(const dash_data_t *d, uint32_t now_ms)
         },
         {
             .label = "BATTERY", .unit = "V", .value = battery,
+            .known = dash_valid(d, DASH_VALID_BATTERY),
             .fill = clamp_permille(d->battery_mv, BATT_BAR_MIN, BATT_BAR_MAX),
             .zone_lo = 0u,
             .zone_hi = clamp_permille(BATT_LOW_MV, BATT_BAR_MIN, BATT_BAR_MAX),
-            .status = battery_status(d->battery_mv, d->rpm),
+            .status = battery_status(d->battery_mv, dash_engine_running(d)),
         },
     };
 
     vital_status_t status[TILE_COUNT];
     for (uint32_t i = 0u; i < TILE_COUNT; i++) {
+        if (!tiles[i].known) { /* nothing to judge: empty bar, no status */
+            tiles[i].value = NO_VALUE;
+            tiles[i].fill = 0u;
+            tiles[i].status = (vital_status_t){LEVEL_OK, NULL, NULL};
+        }
         draw_tile(i, &tiles[i]);
         status[i] = tiles[i].status;
     }
@@ -480,9 +534,42 @@ eve_status_t dashboard_draw_splash(const char *fw_version, uint32_t chip_id, uin
     return eve_cmd_flush();
 }
 
+/* Bottom-right corner: where the data comes from, unless all is well. */
+static void draw_link_status(dash_link_t link)
+{
+    const char *text;
+    uint32_t rgb;
+    int16_t font = FONT_SMALL;
+
+    switch (link) {
+    case DASH_LINK_DEMO:
+        text = "DEMO DATA";
+        rgb = COL_TEXT_FAINT;
+        font = FONT_TINY;
+        break;
+    case DASH_LINK_WAITING:
+        text = "WAITING FOR ECU";
+        rgb = COL_AMBER;
+        break;
+    case DASH_LINK_LOST:
+        text = "NO DATA FROM ECU";
+        rgb = COL_RED;
+        break;
+    case DASH_LINK_CAN_FAULT:
+        text = "CAN BUS FAULT";
+        rgb = COL_RED;
+        break;
+    case DASH_LINK_OK:
+    default:
+        return;
+    }
+    eve_color(rgb);
+    eve_cmd_text(SCREEN_W - 16, SCREEN_H - 16, font, OPT_RIGHTX | OPT_CENTERY, text);
+}
+
 /* One frame of the pre-start guide, or of the main screen when there is no
  * guide step to show or `guide` is false. */
-static eve_status_t draw_frame(const dash_data_t *d, bool demo, uint32_t now_ms, bool guide)
+static eve_status_t draw_frame(const dash_data_t *d, uint32_t now_ms, bool guide)
 {
     const guide_step_t step = guide ? guide_step(d) : GUIDE_NONE;
 
@@ -494,27 +581,25 @@ static eve_status_t draw_frame(const dash_data_t *d, bool demo, uint32_t now_ms,
         guide_draw(d, step, now_ms);
     } else {
         const bool flash_on = ((now_ms / 100u) & 1u) == 0u; /* 5 Hz shift flash */
+        const uint32_t rpm = dash_valid(d, DASH_VALID_RPM) ? d->rpm : 0u; /* lights off without data */
         ui_attach_fonts();
-        draw_shift_lights(d->rpm, flash_on);
-        draw_rev_bar(d->rpm);
-        draw_speed_rpm(d->speed_kph, d->rpm);
-        draw_gear(d->gear, d->rpm, flash_on);
+        draw_shift_lights(rpm, flash_on);
+        draw_rev_bar(rpm);
+        draw_speed_rpm(d);
+        draw_gear(d, rpm, flash_on);
+        draw_lamps(d->warnings);
         draw_vitals(d, now_ms);
     }
-
-    if (demo) {
-        eve_color(COL_TEXT_FAINT);
-        eve_cmd_text(SCREEN_W - 16, SCREEN_H - 16, FONT_TINY, OPT_RIGHTX | OPT_CENTERY, "DEMO DATA");
-    }
+    draw_link_status(d->link);
 
     eve_cmd(DISPLAY());
     eve_cmd_swap();
     return eve_cmd_flush();
 }
 
-eve_status_t dashboard_draw(const dash_data_t *d, bool demo, uint32_t now_ms)
+eve_status_t dashboard_draw(const dash_data_t *d, uint32_t now_ms)
 {
-    return draw_frame(d, demo, now_ms, true);
+    return draw_frame(d, now_ms, true);
 }
 
 eve_status_t dashboard_rev_sweep(const dash_data_t *base, uint32_t duration_ms)
@@ -530,12 +615,13 @@ eve_status_t dashboard_rev_sweep(const dash_data_t *base, uint32_t duration_ms)
 
         dash_data_t d = *base;
         d.rpm = (uint16_t)(t <= half ? RPM_MAX * t / half : RPM_MAX * (2u * half - t) / half);
+        d.valid |= DASH_VALID_RPM;
 
         /* One frame in flight at a time: the co-processor's CMD_DLSTART
          * waits for the previous swap, so this runs at the panel's frame rate. */
         eve_status_t st = eve_cmd_wait_idle(100u);
         if (st == EVE_OK) {
-            st = draw_frame(&d, false, start + t, false); /* always the gauges */
+            st = draw_frame(&d, start + t, false); /* always the gauges */
         }
         if (st != EVE_OK || t >= 2u * half) {
             return st;

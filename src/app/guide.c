@@ -50,39 +50,51 @@
  * Step logic
  * ------------------------------------------------------------------------ */
 
+/* The input each step waits for; 0 for the start step, which is always shown. */
+static const uint16_t k_step_input[GUIDE_STEPS] = {DASH_VALID_ESTOP, DASH_VALID_WHEEL, 0u};
+
 guide_step_t guide_step(const dash_data_t *d)
 {
-    if (dash_engine_running(d) || d->speed_kph > 0u) {
+    const bool parked = dash_valid(d, DASH_VALID_RPM | DASH_VALID_SPEED) && d->rpm < DASH_RPM_RUNNING &&
+                        d->speed_kph == 0u;
+    if (!parked && d->link != DASH_LINK_WAITING) {
         return GUIDE_NONE;
     }
-    if (d->estop_active) {
+    if (dash_valid(d, DASH_VALID_ESTOP) && d->estop_active) {
         return GUIDE_ESTOP;
     }
-    if (!d->wheel_connected) {
+    if (dash_valid(d, DASH_VALID_WHEEL) && !d->wheel_connected) {
         return GUIDE_WHEEL;
     }
     return GUIDE_START;
 }
 
-bool guide_start_ready(const dash_data_t *d)
+guide_start_t guide_start_state(const dash_data_t *d)
 {
-    return d->gear == 0u || d->clutch_held;
+    const bool gear_known = dash_valid(d, DASH_VALID_GEAR);
+    const bool clutch_known = dash_valid(d, DASH_VALID_CLUTCH);
+    if ((gear_known && d->gear == 0u) || (clutch_known && d->clutch_held)) {
+        return GUIDE_START_READY;
+    }
+    return gear_known && clutch_known ? GUIDE_START_BLOCKED : GUIDE_START_UNKNOWN;
 }
 
 /* ---------------------------------------------------------------------------
  * Pieces
  * ------------------------------------------------------------------------ */
 
-/* Three pills: done ones green with a tick, the current one outlined in white. */
-static void draw_stepper(guide_step_t current)
+/* Three pills: done ones green with a tick, the current one outlined in white,
+ * and ones whose input isn't wired up dimmed with a dash. */
+static void draw_stepper(const dash_data_t *d, guide_step_t current)
 {
     static const char *const labels[GUIDE_STEPS] = {"E-STOP OFF", "WHEEL IN", "START"};
     const int32_t r = (STEP_Y1 - STEP_Y0) / 2;
     const int32_t cy = (STEP_Y0 + STEP_Y1) / 2;
 
     for (uint32_t i = 0u; i < GUIDE_STEPS; i++) {
-        const bool done = i < (uint32_t)current;
         const bool now = i == (uint32_t)current;
+        const bool unknown = !now && k_step_input[i] != 0u && !dash_valid(d, k_step_input[i]);
+        const bool done = !unknown && i < (uint32_t)current;
         const int32_t x0 = ui_spread_x(i, GUIDE_STEPS, STEP_X0, STEP_X1, STEP_GAP);
         const int32_t x1 = ui_spread_x(i + 1u, GUIDE_STEPS, STEP_X0, STEP_X1, STEP_GAP) - STEP_GAP;
 
@@ -100,6 +112,9 @@ static void draw_stepper(guide_step_t current)
         ui_dot(bx, cy, 13, done ? COL_GREEN : (now ? COL_TEXT : COL_PANEL_EDGE));
         if (done) {
             ui_check(bx, cy, COL_BG);
+        } else if (unknown) {
+            eve_color(COL_TEXT_FAINT);
+            eve_cmd_text((int16_t)bx, (int16_t)cy, FONT_SMALL, OPT_CENTER, "-");
         } else {
             eve_color(now ? COL_BG : COL_TEXT_DIM);
             eve_cmd_number((int16_t)bx, (int16_t)cy, FONT_SMALL, OPT_CENTER, (int32_t)(i + 1u));
@@ -188,11 +203,13 @@ static void draw_start_icon(int32_t cx, int32_t cy, uint32_t ring, bool glow, ui
  * Start step
  * ------------------------------------------------------------------------ */
 
-/* One of the two conditions: green with a tick when met, hollow when not.
- * `gear`, if not NULL, is shown in a small box like the main gear display. */
-static void draw_condition(int32_t x0, int32_t x1, const char *label, const char *gear, bool met)
+/* One of the two conditions: green with a tick when met, hollow when not,
+ * dimmed with "--" when its input isn't known. `gear`, if not NULL, is shown
+ * in a small box like the main gear display. */
+static void draw_condition(int32_t x0, int32_t x1, const char *label, const char *gear, bool known, bool met)
 {
     const int32_t cy = (COND_Y0 + COND_Y1) / 2;
+    met = met && known;
 
     ui_rect(x0, COND_Y0, x1, COND_Y1, met ? COL_GREEN : COL_PANEL_EDGE, 10);
     ui_rect(x0 + 2, COND_Y0 + 2, x1 - 2, COND_Y1 - 2, met ? COL_GREEN_DARK : COL_PANEL, 8);
@@ -203,21 +220,26 @@ static void draw_condition(int32_t x0, int32_t x1, const char *label, const char
         ui_dot(x0 + 26, cy, 12, COL_TEXT_FAINT);
         ui_dot(x0 + 26, cy, 10, COL_PANEL);
     }
-    eve_color(met ? COL_TEXT : COL_TEXT_DIM);
+    eve_color(met ? COL_TEXT : (known ? COL_TEXT_DIM : COL_TEXT_FAINT));
     eve_cmd_text((int16_t)(x0 + 48), (int16_t)cy, FONT_SMALL, OPT_CENTERY, label);
+    if (gear == NULL && !known) {
+        eve_color(COL_TEXT_FAINT);
+        eve_cmd_text((int16_t)(x1 - 18), (int16_t)cy, FONT_MEDIUM, OPT_RIGHTX | OPT_CENTERY, "--");
+    }
     if (gear != NULL) {
         ui_rect(x1 - 46, cy - 15, x1 - 14, cy + 15, met ? COL_GREEN : COL_PANEL_EDGE, 6);
         ui_rect(x1 - 44, cy - 13, x1 - 16, cy + 13, met ? COL_GREEN_DARK : COL_PANEL, 5);
-        eve_color(met ? COL_GREEN : COL_TEXT);
+        eve_color(met ? COL_GREEN : (known ? COL_TEXT : COL_TEXT_FAINT));
         eve_cmd_text((int16_t)(x1 - 30), (int16_t)cy, FONT_MEDIUM, OPT_CENTER, gear);
     }
 }
 
 static void draw_start_step(const dash_data_t *d, uint32_t now_ms)
 {
-    const bool neutral = d->gear == 0u;
-    const bool ready = guide_start_ready(d);
-    const bool cranking = d->rpm >= GUIDE_RPM_CRANKING;
+    const guide_start_t state = guide_start_state(d);
+    const bool ready = state == GUIDE_START_READY;
+    const bool cranking = dash_valid(d, DASH_VALID_RPM) && d->rpm >= GUIDE_RPM_CRANKING;
+    const bool gear_known = dash_valid(d, DASH_VALID_GEAR) && d->gear <= 9u;
 
     draw_start_icon(CX, ICON_Y, cranking ? COL_TEXT : (ready ? COL_GREEN : COL_TEXT_FAINT), ready && !cranking,
                     now_ms);
@@ -235,10 +257,14 @@ static void draw_start_step(const dash_data_t *d, uint32_t now_ms)
                  "Only starts in neutral or with the clutch held");
 
     /* Both conditions, live: either one is enough. */
-    const char gear_str[2] = {neutral ? 'N' : (char)('0' + d->gear), '\0'};
+    char gear_str[2] = {'-', '\0'};
+    if (gear_known) {
+        gear_str[0] = d->gear == 0u ? 'N' : (char)('0' + d->gear);
+    }
     const int32_t mid = (CARD_X0 + CARD_X1) / 2;
-    draw_condition(CARD_X0 + 16, mid - COND_GAP / 2, "NEUTRAL", gear_str, neutral);
-    draw_condition(mid + COND_GAP / 2, CARD_X1 - 16, "CLUTCH HELD", NULL, d->clutch_held);
+    draw_condition(CARD_X0 + 16, mid - COND_GAP / 2, "NEUTRAL", gear_str, gear_known, d->gear == 0u);
+    draw_condition(mid + COND_GAP / 2, CARD_X1 - 16, "CLUTCH HELD", NULL, dash_valid(d, DASH_VALID_CLUTCH),
+                   d->clutch_held);
     eve_color(COL_AMBER);
     eve_cmd_text((int16_t)mid, (COND_Y0 + COND_Y1) / 2, FONT_TINY, OPT_CENTER, "OR");
 
@@ -248,10 +274,10 @@ static void draw_start_step(const dash_data_t *d, uint32_t now_ms)
     } else if (ready) {
         eve_color(COL_GREEN);
         eve_cmd_text(CX, VERDICT_Y, FONT_SMALL, OPT_CENTER, "READY TO START");
-    } else {
+    } else if (state == GUIDE_START_BLOCKED) {
         eve_color(COL_AMBER);
         eve_cmd_text(CX, VERDICT_Y, FONT_SMALL, OPT_CENTER, "NOT READY");
-    }
+    } /* unknown: no verdict rather than a wrong one */
 }
 
 /* ---------------------------------------------------------------------------
@@ -260,7 +286,7 @@ static void draw_start_step(const dash_data_t *d, uint32_t now_ms)
 
 void guide_draw(const dash_data_t *d, guide_step_t step, uint32_t now_ms)
 {
-    draw_stepper(step);
+    draw_stepper(d, step);
 
     switch (step) {
     case GUIDE_ESTOP:
